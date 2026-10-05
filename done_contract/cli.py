@@ -292,6 +292,9 @@ def main(argv: list[str] | None = None) -> int:
     except core.NotInteractive as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 3
+    except core.LockBusy as exc:  # could not verify: same class as ERROR, never a contract/usage error
+        print(f"error (unverified): {exc}", file=sys.stderr)
+        return 5
     except core.DoneContractError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

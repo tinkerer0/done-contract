@@ -171,6 +171,12 @@ def stop(payload: dict, *, require_contract: bool = False) -> dict | None:
     try:
         ev = core.run_check(repo, task, reuse=True, session=session, budget_s=_budget())
     except core.LockBusy as exc:
+        # same block budget as any other non-passing outcome; past the cap, release visibly as unverified
+        if state["blocks"] >= max_blocks:
+            logged = core.log_event({"event": "stop", "repo": str(repo), "task": task, "session": session, "decision": "release",
+                                     "why": "lock_busy_cap", "blocks": state["blocks"]})
+            return {"systemMessage": _with_log_note(
+                f"done-contract: 차단 상한({max_blocks})에 도달해 통과시킨다. 계약 '{task}'은 검증되지 않았다 ({exc}).", logged)}
         state["blocks"] = int(state["blocks"]) + 1
         _save_state(key, state)
         core.log_event({"event": "stop", "repo": str(repo), "task": task, "session": session, "decision": "block", "why": "lock_busy",

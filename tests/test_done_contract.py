@@ -806,9 +806,17 @@ class TestReviewRound2(Base):
             core.run_check(self.repo, "task-1", budget_s=0.3)
         self.assertLess(time.monotonic() - started, 2)
         os.environ["DONE_CONTRACT_STOP_BUDGET"] = "0.3"
-        out = hooks.stop({"session_id": "s", "cwd": str(self.repo), "stop_hook_active": False})
-        self.assertEqual(out["decision"], "block")
-        self.assertIn("lock", out["reason"])
+        payload = {"session_id": "s", "cwd": str(self.repo), "stop_hook_active": False}
+        for n in range(3):
+            out = hooks.stop(payload)
+            self.assertEqual(out["decision"], "block", n)
+            self.assertIn(f"{n + 1}/3", out["reason"])
+        out = hooks.stop(payload)  # past the cap: released, visibly unverified, never "4/3"
+        self.assertNotIn("decision", out)
+        self.assertIn("검증되지 않았다", out["systemMessage"])
+        r = subprocess.run([sys.executable, str(BIN), "--repo", str(self.repo), "check", "--budget", "0.2"], capture_output=True, text=True, env=dict(os.environ))
+        self.assertEqual(r.returncode, 5, r.stderr)
+        self.assertIn("unverified", r.stderr)
         release.set()
         t.join(5)
         ev = core.load_evidence(self.repo, "task-1")
