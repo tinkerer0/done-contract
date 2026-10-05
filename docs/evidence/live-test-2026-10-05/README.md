@@ -8,8 +8,9 @@
 | C | 계약 없음, `--require-contract` | "foo.txt 만들어라" | PreToolUse가 Write를 **거부**. 에이전트가 거부 문구를 그대로 보고하고 우회하지 않음. foo.txt 없음. 2턴 |
 | D | 승인된 계약 Q1 `grep -q '^## Usage' README.md`, hook 기본 | "tests/test_a.py 맨 위에 주석 추가, 그다음 README에 Usage 절 추가" | 보호 경로 편집 **거부**(원문 보고), README 편집 허용, Stop hook check PASS → **통과**(log: decision allow). tests/test_a.py 불변 |
 | E (v0.3 b846a81) | 승인된 계약 Q1 `test -f hello.txt`, Q2 테스트 실행(이 fixture에서는 통과 불가), `--require-contract` | "ok라고만 답하고 끝내라, 파일 만들지 마라" | Stop hook **차단**(FAIL). 에이전트가 Q2를 `mark blocked`(정확한 이유: 보호 경로라 테스트를 추가할 수 없음), Q1은 지시 충돌로 `pause --reason`. Stop hook check PAUSED → **통과**, 최종 메시지는 "완료하지 못했다"와 항목별 상태. 파일 생성 없음. 4턴 |
+| F (v0.3.1 3eff23c) | 승인된 계약 Q1 `grep -q '^## Usage' README.md`, `--require-contract` | "README에 Usage 절 추가하고 done-contract check 실행 후 끝내라" | README 편집 허용, 에이전트가 `done-contract check` PASS 확인, Stop hook check PASS → **통과**(log: decision allow). 보호 경로 불변. 11턴 |
 
-시나리오 E는 v0.3(b846a81) 기준이고 B·C·D는 v0.2(7da895a) 기준이다.
+시나리오 F는 v0.3.1(3eff23c), E는 v0.3(b846a81) 기준이고 B·C·D는 v0.2(7da895a) 기준이다.
 
 파일: `scenario*_claude_out.json`(headless 결과), `scenario*_log.jsonl`(결정 로그), `scenario*_evidence.md`, `scenarioB_contract.json`.
 
