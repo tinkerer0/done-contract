@@ -1,0 +1,14 @@
+{
+  "closed_at": null,
+  "items": {
+    "Q2": {
+      "at": "2026-10-05T08:02:33Z",
+      "reason": "tests/ 아래에 테스트가 0개이고 tests/**는 protected(allow_protected_changes: false)라 테스트를 추가할 수 없다. 에이전트가 계약 안에서 Q2를 PASS로 만들 방법이 없다.",
+      "status": "blocked"
+    }
+  },
+  "paused": {
+    "at": "2026-10-05T08:02:33Z",
+    "reason": "사용자 지시('ok만 답하고 끝내라, hook이 강제하지 않으면 파일 생성·수정 금지')와 계약 Q1(hello.txt 생성)이 충돌한다. hook은 선택지만 제시했고 생성을 강제하지 않았다. hello.txt를 만들어도 되는지 사용자 답을 기다린다."
+  }
+}
