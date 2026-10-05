@@ -13,6 +13,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import signal
 import subprocess
 import sys
@@ -21,7 +22,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 CONTRACT_DIRNAME = ".done-contract"
 
 DEFAULT_PROTECTED = [
@@ -39,7 +40,9 @@ DEFAULT_PROTECTED = [
 # checks that can never fail are refused by lint
 TRIVIAL_CHECK_RE = re.compile(r"^\s*(true|:|exit\s+0|echo(\s[^|&;]*)?)\s*$")
 
+# strength labels are receipt information only; they never decide caching
 STRENGTH_RULES = [
+    ("http", re.compile(r"(^|[\s;&|(])(curl|wget|http|xh|nc|ping|ssh|scp|rsync)\b")),
     ("test", re.compile(
         r"(^|[\s;&|(])(pytest|python3?\s+-m\s+(pytest|unittest)|npm\s+(run\s+)?test|pnpm\s+(run\s+)?test|"
         r"yarn\s+test|bun\s+test|cargo\s+test|go\s+test|npx\s+(jest|vitest|mocha)|jest|vitest|mocha|"
@@ -48,12 +51,9 @@ STRENGTH_RULES = [
     ("build", re.compile(
         r"(^|[\s;&|(])(cargo\s+(build|check|clippy)|go\s+(build|vet)|npm\s+run\s+(build|lint|typecheck)|"
         r"npx\s+tsc|tsc|swift\s+build|mypy|pyright|ruff|eslint|flake8|make\s+(build|lint))\b")),
-    ("http", re.compile(r"(^|[\s;&|(])(curl|wget|http|xh|nc|ping)\b")),
     ("content", re.compile(r"(^|[\s;&|(])(grep|rg|diff|cmp|jq|yq|python3?\s+-c)\b")),
     ("existence", re.compile(r"(^|[\s;&|(])(test\s+-[efdsx]|\[\s+-[efdsx]|ls|stat|file|which)\b")),
 ]
-# only these strengths may reuse a previous result for an unchanged tree
-CACHEABLE_STRENGTHS = {"test", "build", "content", "existence"}
 
 TASK_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 ITEM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
@@ -79,6 +79,10 @@ EXIT_CODES = {
     VERDICT_INCOMPLETE: 4, VERDICT_PAUSED: 4,
     VERDICT_ERROR: 5,
 }
+
+DEFAULT_ITEM_TIMEOUT = 300
+REPO_CHECK_TIMEOUT = 900
+MAX_OUTPUT_SEARCH_BYTES = 200 * 1024 * 1024
 
 
 class DoneContractError(Exception):
@@ -116,24 +120,28 @@ def read_json(path: Path, default=None):
 
 
 def write_json(path: Path, obj, mode: int | None = None) -> None:
+    """Atomic replace through a uniquely named temp file in the same directory."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(obj, fh, ensure_ascii=False, indent=2, sort_keys=True)
-        fh.write("\n")
-    if mode is not None:
-        os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            fh.write("\n")
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def home_dir() -> Path:
     override = os.environ.get("DONE_CONTRACT_HOME")
     base = Path(override).expanduser() if override else Path.home() / CONTRACT_DIRNAME
     base.mkdir(parents=True, exist_ok=True)
-    try:
+    with contextlib.suppress(OSError):
         os.chmod(base, 0o700)
-    except OSError:
-        pass
     return base
 
 
@@ -150,7 +158,7 @@ def log_event(event: dict) -> bool:
 
 @contextlib.contextmanager
 def repo_lock(repo: Path):
-    """Serialize check/mark/close within one worktree (two sessions, one .done-contract/)."""
+    """Serialize state changes within one worktree (two sessions, one .done-contract/)."""
     root = contract_root(repo)
     root.mkdir(parents=True, exist_ok=True)
     ensure_excluded(repo)  # before the lock file exists, so it never enters a tree hash
@@ -164,10 +172,11 @@ def repo_lock(repo: Path):
 
 # ---------------------------------------------------------------- git
 
-def git(repo: Path, *args: str, env: dict | None = None, check: bool = True) -> str:
-    proc = subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True, env=env)
+def git(repo: Path, *args: str, env: dict | None = None, check: bool = True, binary: bool = False):
+    proc = subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=not binary, env=env)
     if check and proc.returncode != 0:
-        raise GitError(f"git {' '.join(args)}: {proc.stderr.strip()}")
+        err = proc.stderr if isinstance(proc.stderr, str) else proc.stderr.decode("utf-8", "replace")
+        raise GitError(f"git {' '.join(args)}: {err.strip()}")
     return proc.stdout
 
 
@@ -186,10 +195,11 @@ def head_sha(repo: Path) -> str | None:
 
 def working_tree_hash(repo: Path) -> str:
     """Hash of the whole working tree: tracked and untracked files, .gitignore and
-    .git/info/exclude respected, symlinks as blobs, submodules as gitlinks.
+    info/exclude respected, symlinks as blobs (link text), submodules as gitlinks.
 
     Uses a temporary index so the user's index is untouched. The tree object is
     stored in the object database so later `git diff <tree> <tree>` works.
+    Not covered: symlink targets outside the repo, ignored files, submodule contents.
     """
     with tempfile.TemporaryDirectory() as td:
         env = dict(os.environ)
@@ -201,18 +211,24 @@ def working_tree_hash(repo: Path) -> str:
 
 
 def changed_paths(repo: Path, tree_a: str, tree_b: str) -> list[str]:
+    """Paths that differ between two trees. NUL-separated, no quoting, renames as delete+add."""
     if tree_a == tree_b:
         return []
-    out = git(repo, "diff", "--name-only", tree_a, tree_b)
-    return [line for line in out.splitlines() if line.strip()]
+    out = git(repo, "-c", "core.quotePath=false", "diff", "--name-only", "-z", "--no-renames", tree_a, tree_b, binary=True)
+    return [p.decode("utf-8", "replace") for p in out.split(b"\0") if p]
 
 
 def ensure_excluded(repo: Path) -> None:
-    """Keep .done-contract/ out of git without touching the user's .gitignore."""
-    info = repo / ".git" / "info"
+    """Keep .done-contract/ out of git without touching the user's .gitignore.
+
+    Works for .git directories, .git files (linked worktrees, separate git dirs)
+    through `git rev-parse --git-path`. Failure is an error, not silence."""
+    out = git(repo, "rev-parse", "--git-path", "info/exclude").strip()
+    exclude = Path(out)
+    if not exclude.is_absolute():
+        exclude = repo / exclude
     try:
-        info.mkdir(parents=True, exist_ok=True)
-        exclude = info / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
         existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
         line = f"{CONTRACT_DIRNAME}/"
         if line not in existing.splitlines():
@@ -220,11 +236,11 @@ def ensure_excluded(repo: Path) -> None:
                 if existing and not existing.endswith("\n"):
                     fh.write("\n")
                 fh.write(line + "\n")
-    except OSError:
-        pass
+    except OSError as exc:
+        raise GitError(f"cannot write {exclude}: {exc}") from exc
 
 
-# ---------------------------------------------------------------- globs
+# ---------------------------------------------------------------- globs and paths
 
 def glob_to_regex(pattern: str) -> re.Pattern:
     out = ""
@@ -250,11 +266,41 @@ def glob_to_regex(pattern: str) -> re.Pattern:
     return re.compile("^" + out + "$")
 
 
-def matches_any(path: str, globs: list[str]) -> bool:
+def normalize_rel(path: str) -> str:
     norm = path.replace(os.sep, "/")
     while norm.startswith("./"):
         norm = norm[2:]
+    return norm
+
+
+def matches_any(path: str, globs: list[str]) -> bool:
+    norm = normalize_rel(path)
     return any(glob_to_regex(g).match(norm) for g in globs)
+
+
+def repo_relative(repo: Path, candidate: str | Path, cwd: Path | None = None) -> tuple[str | None, str | None]:
+    """(lexical, resolved) repo-relative POSIX paths for a file reference.
+
+    lexical: normalized without following symlinks (what the agent names).
+    resolved: after symlink resolution. Either may be None when outside the repo."""
+    p = Path(candidate)
+    if not p.is_absolute():
+        p = (cwd or repo) / p
+    repo_r = repo.resolve()
+    lexical = None
+    resolved = None
+    try:
+        lexical = Path(os.path.normpath(str(p))).relative_to(repo).as_posix()
+    except ValueError:
+        try:
+            lexical = Path(os.path.normpath(str(p))).relative_to(repo_r).as_posix()
+        except ValueError:
+            lexical = None
+    try:
+        resolved = p.resolve().relative_to(repo_r).as_posix()
+    except (ValueError, OSError):
+        resolved = None
+    return lexical, resolved
 
 
 # ---------------------------------------------------------------- contract files
@@ -279,10 +325,8 @@ def active_task(repo: Path) -> str | None:
 def set_active(repo: Path, task: str | None) -> None:
     p = contract_root(repo) / "active"
     if task is None:
-        try:
+        with contextlib.suppress(FileNotFoundError):
             p.unlink()
-        except FileNotFoundError:
-            pass
         return
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(task + "\n", encoding="utf-8")
@@ -318,9 +362,8 @@ def strength_of(check: str) -> str:
 
 
 def item_cacheable(item: dict) -> bool:
-    if item.get("cache") is False:
-        return False
-    return strength_of(str(item.get("check", ""))) in CACHEABLE_STRENGTHS
+    """Only an explicit, human-approved `cache: true` allows reuse for an unchanged tree."""
+    return item.get("cache") is True
 
 
 def lint_contract(contract: dict) -> list[str]:
@@ -365,7 +408,7 @@ def lint_contract(contract: dict) -> list[str]:
             problems.append(f"{where}.check is required: an executable command that fails when the item is not done")
         elif TRIVIAL_CHECK_RE.match(check):
             problems.append(f"{where}.check '{check.strip()}' can never fail; use a real check")
-        timeout = item.get("timeout", 300)
+        timeout = item.get("timeout", DEFAULT_ITEM_TIMEOUT)
         if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0 or timeout > 3600:
             problems.append(f"{where}.timeout must be an integer 1..3600 (seconds)")
         expect = item.get("expect")
@@ -415,7 +458,7 @@ def contract_state(repo: Path, task: str) -> str:
     if marks.get("abandoned"):
         return "abandoned"
     contract = read_json(task_dir(repo, task) / "contract.json")
-    if contract and find_approval(repo, contract):
+    if isinstance(contract, dict) and find_approval(repo, contract):
         return "approved"
     return "draft"
 
@@ -446,8 +489,9 @@ def init_contract(repo: Path, task: str, request: str, *, abandon_reason: str | 
         tdir.mkdir(parents=True, exist_ok=True)
         write_json(tdir / "contract.json", contract)
         write_json(tdir / "marks.json", {"items": {}, "paused": None, "closed_at": None})
+        with contextlib.suppress(FileNotFoundError):
+            (tdir / "evidence.json").unlink()
         set_active(repo, task)
-        ensure_excluded(repo)
         log_event({"event": "init", "repo": str(repo), "task": task})
         return contract
 
@@ -466,10 +510,8 @@ def _abandon(repo: Path, task: str, reason: str) -> None:
 def approval_path(sha: str) -> Path:
     d = home_dir() / "approved"
     d.mkdir(parents=True, exist_ok=True)
-    try:
+    with contextlib.suppress(OSError):
         os.chmod(d, 0o700)
-    except OSError:
-        pass
     return d / f"{sha}.json"
 
 
@@ -497,8 +539,8 @@ def approve_contract(repo: Path, task: str, *, approver: str | None = None, assu
         raise NotInteractive(
             "approve must be run by a person in an interactive terminal "
             "(stdin is not a TTY). Agents must not approve their own contract.")
-    current_tree = working_tree_hash(repo)
-    dirty = changed_paths(repo, contract["baseline_tree"], current_tree)
+    shown_tree = working_tree_hash(repo)
+    dirty = changed_paths(repo, contract["baseline_tree"], shown_tree)
     if dirty and not accept_dirty:
         raise DoneContractError(
             "working tree changed since init (work before approval): " + ", ".join(dirty[:20])
@@ -515,19 +557,30 @@ def approve_contract(repo: Path, task: str, *, approver: str | None = None, assu
         answer = stdin.readline().strip().lower()
         if answer not in ("y", "yes"):
             raise DoneContractError("approval declined")
-    record = {
-        "sha256": sha,
-        "task": task,
-        "repo": str(repo),
-        "approved_at": now_iso(),
-        "approver": approver or os.environ.get("USER") or "unknown",
-        "interactive": interactive,
-        "tree_at_approval": current_tree,
-        "pre_approval_changes": dirty,
-        "items": [{"id": it["id"], "strength": strength_of(it["check"]), "cacheable": item_cacheable(it)} for it in contract["items"]],
-        "contract": contract,
-    }
-    write_json(approval_path(sha), record, mode=0o600)
+    with repo_lock(repo):
+        # re-check what was shown: the contract and the tree must not have moved while the person was reading
+        if contract_sha(load_contract(repo, task)) != sha:
+            raise DoneContractError("contract changed while waiting for approval; review it and run approve again")
+        if active_task(repo) != task:
+            raise DoneContractError("active contract changed while waiting for approval; run approve again")
+        final_tree = working_tree_hash(repo)
+        if final_tree != shown_tree:
+            moved = changed_paths(repo, shown_tree, final_tree)
+            raise DoneContractError("working tree changed while waiting for approval: " + ", ".join(moved[:20])
+                                    + "\nreview the changes and run approve again")
+        record = {
+            "sha256": sha,
+            "task": task,
+            "repo": str(repo),
+            "approved_at": now_iso(),
+            "approver": approver or os.environ.get("USER") or "unknown",
+            "interactive": interactive,
+            "tree_at_approval": final_tree,
+            "pre_approval_changes": dirty,
+            "items": [{"id": it["id"], "strength": strength_of(it["check"]), "cacheable": item_cacheable(it)} for it in contract["items"]],
+            "contract": contract,
+        }
+        write_json(approval_path(sha), record, mode=0o600)
     log_event({"event": "approve", "repo": str(repo), "task": task, "sha": sha, "interactive": interactive,
                "pre_approval_changes": len(dirty)})
     return record
@@ -539,13 +592,13 @@ def render_contract_summary(contract: dict) -> str:
     lines.append("items:")
     for it in contract.get("items", []):
         check = str(it.get("check", ""))
-        cache = "cached when tree unchanged" if item_cacheable(it) else "re-run every time"
+        cache = "CACHED when tree unchanged (opt-in)" if item_cacheable(it) else "re-run every time"
         lines.append(f"  {it.get('id')}: {it.get('text')}")
         lines.append(f"      check [{strength_of(check)}, {cache}]: {check}")
         if it.get("expect"):
             lines.append(f"      expect: {it['expect']}")
     if contract.get("repo_checks"):
-        lines.append("repo_checks: " + "; ".join(contract["repo_checks"]))
+        lines.append("repo_checks (re-run every time): " + "; ".join(contract["repo_checks"]))
     lines.append(f"protected: {', '.join(contract.get('protected', [])) or '(none)'}")
     if contract.get("allow_protected_changes"):
         lines.append("allow_protected_changes: true — the agent may add, change AND delete files under protected paths")
@@ -621,36 +674,81 @@ def is_closed(repo: Path, task: str) -> bool:
 
 # ---------------------------------------------------------------- running checks
 
-def run_command(cmd: str, cwd: Path, timeout: int, tail_lines: int = 40, tail_bytes: int = 4000) -> dict:
+def _search_file(path: str, needle: bytes) -> bool:
+    size = os.path.getsize(path)
+    chunk = 8 * 1024 * 1024
+    overlap = len(needle) - 1
+    with open(path, "rb") as fh:
+        if size <= chunk:
+            return needle in fh.read()
+        prev = b""
+        read = 0
+        while read < min(size, MAX_OUTPUT_SEARCH_BYTES):
+            buf = fh.read(chunk)
+            if not buf:
+                break
+            read += len(buf)
+            window = (prev[-overlap:] if overlap > 0 else b"") + buf
+            if needle in window:
+                return True
+            prev = buf
+    return False
+
+
+def _tail_of_file(path: str, tail_lines: int, tail_bytes: int) -> str:
+    size = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        fh.seek(max(0, size - 64 * 1024))
+        data = fh.read()
+    text = data.decode("utf-8", "replace")
+    lines = text.splitlines()[-tail_lines:]
+    return "\n".join(lines)[-tail_bytes:]
+
+
+def _hash_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for buf in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(buf)
+    return h.hexdigest()
+
+
+def run_command(cmd: str, cwd: Path, timeout: float, *, expect: str | None = None,
+                tail_lines: int = 40, tail_bytes: int = 4000) -> dict:
+    """Run one check exactly once. Output is streamed to a temp file; `expect` is
+    searched over the full output; only a tail is kept in the evidence."""
     env = dict(os.environ)
     env.setdefault("CI", "1")
     env["DONE_CONTRACT"] = "1"
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    timeout = max(0.01, float(timeout))
     started = time.monotonic()
     timed_out = False
     exit_code: int | None = None
-    output = ""
-    proc = subprocess.Popen(cmd, shell=True, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            stdin=subprocess.DEVNULL, env=env, text=True, start_new_session=True)
+    fd, out_path = tempfile.mkstemp(prefix="done-contract-out-")
     try:
-        output, _ = proc.communicate(timeout=timeout)
-        exit_code = proc.returncode
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        try:
-            output, _ = proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            output = ""
-    duration = round(time.monotonic() - started, 2)
-    output = output or ""
-    lines = output.splitlines()[-tail_lines:]
-    tail = "\n".join(lines)[-tail_bytes:]
-    return {"command": cmd, "exit": exit_code, "timed_out": timed_out, "duration_s": duration, "output_tail": tail,
-            "output_sha256": sha256_bytes(output.encode("utf-8", "replace"))}
+        with os.fdopen(fd, "wb") as out_fh:
+            proc = subprocess.Popen(cmd, shell=True, cwd=str(cwd), stdout=out_fh, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, env=env, start_new_session=True)
+            try:
+                exit_code = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=5)
+        duration = round(time.monotonic() - started, 2)
+        tail = _tail_of_file(out_path, tail_lines, tail_bytes)
+        expect_matched = None
+        if expect is not None:
+            expect_matched = _search_file(out_path, expect.encode("utf-8"))
+        return {"command": cmd, "exit": exit_code, "timed_out": timed_out, "timeout_s": round(timeout, 2),
+                "duration_s": duration, "output_tail": tail, "output_bytes": os.path.getsize(out_path),
+                "output_sha256": _hash_file(out_path), "expect_matched": expect_matched}
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(out_path)
 
 
 def _hmac_key() -> bytes:
@@ -658,11 +756,15 @@ def _hmac_key() -> bytes:
     try:
         return path.read_bytes().strip()
     except FileNotFoundError:
-        key = secrets.token_hex(32).encode("ascii")
-        with open(path, "wb") as fh:
-            fh.write(key + b"\n")
-        os.chmod(path, 0o600)
-        return key
+        pass
+    key = secrets.token_hex(32).encode("ascii")
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return path.read_bytes().strip()
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(key + b"\n")
+    return key
 
 
 def sign_evidence(evidence: dict) -> str:
@@ -682,11 +784,12 @@ def load_evidence(repo: Path, task: str) -> dict | None:
 
 
 def evidence_is_current(repo: Path, task: str, ev: dict | None, contract: dict, marks: dict, tree: str) -> bool:
-    """Shared validity rule for reuse/close: same task, contract, approval, marks, tree, intact HMAC."""
+    """Shared validity rule: same task, repo, contract, approval, marks, tree, finished run, intact HMAC."""
     if not ev:
         return False
     try:
         return (ev.get("task") == task and ev.get("repo") == str(repo)
+                and not ev.get("in_progress")
                 and ev.get("contract_sha256") == contract_sha(contract)
                 and find_approval(repo, contract) is not None
                 and ev.get("marks_sha256") == marks_digest(marks)
@@ -700,7 +803,7 @@ def evidence_is_current(repo: Path, task: str, ev: dict | None, contract: dict, 
 
 def compute_verdict(item_results: list[dict], repo_results: list[dict], protected_changed: list[str],
                     allow_protected: bool, paused: dict | None, stale: bool) -> str:
-    """Precedence: STALE > ERROR > (paused → PAUSED) > FAIL > TESTS_CHANGED > INCOMPLETE > PASS."""
+    """Precedence: STALE > ERROR > PAUSED > FAIL > TESTS_CHANGED > INCOMPLETE > PASS."""
     if stale:
         return VERDICT_STALE
     if any(r["status"] == "ERROR" for r in item_results) or any(r["status"] == "ERROR" for r in repo_results):
@@ -718,21 +821,15 @@ def compute_verdict(item_results: list[dict], repo_results: list[dict], protecte
     return VERDICT_PASS
 
 
-def _run_item(it: dict, repo: Path) -> tuple[bool, bool, dict]:
-    res = run_command(it["check"], repo, int(it.get("timeout", 300)))
-    passed = res["exit"] == 0 and not res["timed_out"]
-    expect = it.get("expect")
-    expect_ok = True
-    if passed and expect:
-        expect_ok = expect in res["output_tail"] or _expect_in_full(it, repo, expect)
-        passed = passed and expect_ok
-    return passed, expect_ok, res
-
-
 def run_check(repo: Path, task: str, *, reuse: bool = True, session: str | None = None,
               budget_s: float | None = None) -> dict:
     with repo_lock(repo):
         return _run_check_locked(repo, task, reuse=reuse, session=session, budget_s=budget_s)
+
+
+def _blank_result(cmd: str) -> dict:
+    return {"command": cmd, "exit": None, "timed_out": False, "timeout_s": None, "duration_s": 0, "output_tail": "",
+            "output_bytes": 0, "output_sha256": None, "expect_matched": None}
 
 
 def _run_check_locked(repo: Path, task: str, *, reuse: bool, session: str | None, budget_s: float | None) -> dict:
@@ -760,53 +857,86 @@ def _run_check_locked(repo: Path, task: str, *, reuse: bool, session: str | None
     prev = load_evidence(repo, task) if reuse else None
     prev_ok = evidence_is_current(repo, task, prev, contract, marks, tree_before)
     prev_items = {it["id"]: it for it in (prev or {}).get("items", [])} if prev_ok else {}
-    prev_repo = {rc["command"]: rc for rc in (prev or {}).get("repo_checks", [])} if prev_ok else {}
 
-    def over_budget() -> bool:
-        return budget_s is not None and (time.monotonic() - started) > budget_s
+    # Invalidate older evidence first: if this run dies, nobody can close on a stale PASS.
+    stub = {**base, "verdict": VERDICT_ERROR, "in_progress": True, "checked_at": now_iso(), "items": [], "repo_checks": [],
+            "changed_paths": [], "protected_changed": [], "reused": False, "approval": None, "paused": marks.get("paused"),
+            "error": "check interrupted before it finished"}
+    stub["hmac"] = sign_evidence(stub)
+    try:
+        write_evidence(repo, task, stub)
+    except Exception:
+        with contextlib.suppress(OSError):
+            evidence_path(repo, task).unlink()
+        raise
+
+    def remaining() -> float | None:
+        if budget_s is None:
+            return None
+        return budget_s - (time.monotonic() - started)
+
+    def effective_timeout(wanted: float) -> tuple[float, bool]:
+        rem = remaining()
+        if rem is None:
+            return wanted, False
+        return (min(wanted, rem), rem < wanted)
 
     item_results = []
     for it in contract["items"]:
         mark = marks["items"].get(it["id"])
         cached = prev_items.get(it["id"])
+        base_row = {"id": it["id"], "text": it["text"], "strength": strength_of(it["check"]),
+                    "expect": it.get("expect"), "blocked_reason": None}
         if cached and item_cacheable(it) and cached.get("status") in ("PASS", "FAIL", "BLOCKED") and cached.get("command") == it["check"]:
-            res = {k: cached.get(k) for k in ("command", "exit", "timed_out", "duration_s", "output_tail", "output_sha256")}
+            res = {k: cached.get(k) for k in _blank_result(it["check"])}
             passed = cached["status"] == "PASS"
-            expect_ok = cached.get("expect_matched")
             reused = True
-        elif over_budget():
-            item_results.append({"id": it["id"], "text": it["text"], "strength": strength_of(it["check"]), "status": "ERROR",
-                                 "error": "not run: stop-hook time budget exhausted; run `done-contract check` manually",
-                                 "command": it["check"], "exit": None, "timed_out": False, "duration_s": 0,
-                                 "output_tail": "", "output_sha256": None, "blocked_reason": None,
-                                 "expect": it.get("expect"), "expect_matched": None, "reused": False})
-            continue
+            error = None
         else:
-            passed, expect_ok, res = _run_item(it, repo)
+            rem = remaining()
+            if rem is not None and rem <= 0:
+                item_results.append({**base_row, **_blank_result(it["check"]), "status": "ERROR", "reused": False,
+                                     "error": "not run: time budget exhausted; run `done-contract check` manually"})
+                continue
+            wanted = float(it.get("timeout", DEFAULT_ITEM_TIMEOUT))
+            timeout, cut = effective_timeout(wanted)
+            try:
+                res = run_command(it["check"], repo, timeout, expect=it.get("expect"))
+                error = None
+            except Exception as exc:
+                res = _blank_result(it["check"])
+                error = f"could not run: {type(exc).__name__}: {str(exc)[:200]}"
+            if error is None and res["timed_out"] and cut:
+                error = f"stopped at the time budget ({timeout:.0f}s of {wanted:.0f}s); run `done-contract check` manually"
+            passed = error is None and res["exit"] == 0 and not res["timed_out"] and (res["expect_matched"] is not False)
             reused = False
-        if passed:
+        if error:
+            status = "ERROR"
+        elif passed:
             status = "PASS"
         elif mark and mark.get("status") == "blocked":
             status = "BLOCKED"
         else:
             status = "FAIL"
-        item_results.append({
-            "id": it["id"], "text": it["text"], "strength": strength_of(it["check"]), "status": status,
-            "blocked_reason": (mark or {}).get("reason") if status == "BLOCKED" else None,
-            "expect": it.get("expect"), "expect_matched": (expect_ok if it.get("expect") else None),
-            "reused": reused, **res,
-        })
+        item_results.append({**base_row, **res, "status": status, "reused": reused, "error": error,
+                             "blocked_reason": (mark or {}).get("reason") if status == "BLOCKED" else None})
     repo_results = []
     for cmd in contract.get("repo_checks", []):
-        cached = prev_repo.get(cmd)
-        if cached and strength_of(cmd) in CACHEABLE_STRENGTHS and cached.get("status") in ("PASS", "FAIL"):
-            repo_results.append({**cached, "reused": True})
-        elif over_budget():
-            repo_results.append({"status": "ERROR", "error": "not run: time budget exhausted", "command": cmd, "exit": None,
-                                 "timed_out": False, "duration_s": 0, "output_tail": "", "output_sha256": None, "reused": False})
-        else:
-            res = run_command(cmd, repo, 900)
-            repo_results.append({"status": "PASS" if res["exit"] == 0 and not res["timed_out"] else "FAIL", "reused": False, **res})
+        rem = remaining()
+        if rem is not None and rem <= 0:
+            repo_results.append({**_blank_result(cmd), "status": "ERROR", "reused": False, "error": "not run: time budget exhausted"})
+            continue
+        timeout, cut = effective_timeout(float(REPO_CHECK_TIMEOUT))
+        try:
+            res = run_command(cmd, repo, timeout)
+            error = None
+        except Exception as exc:
+            res = _blank_result(cmd)
+            error = f"could not run: {type(exc).__name__}: {str(exc)[:200]}"
+        if error is None and res["timed_out"] and cut:
+            error = f"stopped at the time budget ({timeout:.0f}s)"
+        status = "ERROR" if error else ("PASS" if res["exit"] == 0 and not res["timed_out"] else "FAIL")
+        repo_results.append({**res, "status": status, "reused": False, "error": error})
     tree_after = working_tree_hash(repo)
     stale = tree_after != tree_before
     changed = changed_paths(repo, contract["baseline_tree"], tree_before)
@@ -818,6 +948,7 @@ def _run_check_locked(repo: Path, task: str, *, reuse: bool, session: str | None
         "verdict": verdict,
         "checked_at": now_iso(),
         "duration_s": round(time.monotonic() - started, 2),
+        "budget_s": budget_s,
         "tree_after": tree_after,
         "stale_paths": changed_paths(repo, tree_before, tree_after) if stale else [],
         "approval": {"approved_at": approval.get("approved_at"), "approver": approval.get("approver"),
@@ -829,18 +960,17 @@ def _run_check_locked(repo: Path, task: str, *, reuse: bool, session: str | None
         "protected_changed": protected_changed,
         "allow_protected_changes": bool(contract.get("allow_protected_changes")),
         "paused": marks.get("paused"),
-        "reused": all(r.get("reused") for r in item_results + repo_results) and bool(item_results),
+        "reused": bool(item_results) and all(r.get("reused") for r in item_results) and not repo_results,
     }
     evidence["hmac"] = sign_evidence(evidence)
-    write_evidence(repo, task, evidence)
+    try:
+        write_evidence(repo, task, evidence)
+    except Exception:
+        with contextlib.suppress(OSError):
+            evidence_path(repo, task).unlink()
+        raise
     log_event({"event": "check", "repo": str(repo), "task": task, "verdict": verdict, "tree": tree_before, "session": session})
     return evidence
-
-
-def _expect_in_full(item: dict, repo: Path, expect: str) -> bool:
-    """Re-run only when the tail missed the expected text (rare, large outputs)."""
-    res = run_command(item["check"], repo, int(item.get("timeout", 300)), tail_lines=10_000_000, tail_bytes=50_000_000)
-    return res["exit"] == 0 and not res["timed_out"] and expect in res["output_tail"]
 
 
 def write_evidence(repo: Path, task: str, evidence: dict) -> None:
@@ -850,18 +980,20 @@ def write_evidence(repo: Path, task: str, evidence: dict) -> None:
 
 def mark_released(repo: Path, task: str, reason: str, session: str | None) -> dict | None:
     """Record that the Stop hook let the agent stop without a passing verdict."""
-    ev = load_evidence(repo, task)
-    if not ev:
-        return None
-    ev["released"] = {"reason": reason, "at": now_iso(), "session": session, "verdict_at_release": ev.get("verdict")}
-    ev["hmac"] = sign_evidence(ev)
-    write_evidence(repo, task, ev)
-    return ev
+    with repo_lock(repo):
+        ev = load_evidence(repo, task)
+        if not ev:
+            return None
+        ev["released"] = {"reason": reason, "at": now_iso(), "session": session, "verdict_at_release": ev.get("verdict")}
+        ev["hmac"] = sign_evidence(ev)
+        write_evidence(repo, task, ev)
+        return ev
 
 
 def render_evidence_md(ev: dict) -> str:
     lines = [f"# done-contract evidence — {ev.get('task')}", "",
-             f"- verdict: **{ev.get('verdict')}**" + ("  (all results reused)" if ev.get("reused") else ""),
+             f"- verdict: **{ev.get('verdict')}**" + ("  (in progress / interrupted)" if ev.get("in_progress") else "")
+             + ("  (all results reused)" if ev.get("reused") else ""),
              f"- checked_at: {ev.get('checked_at')}  duration: {ev.get('duration_s')}s",
              f"- tree: `{ev.get('tree')}`  baseline: `{ev.get('baseline_tree')}`",
              f"- contract sha256: `{ev.get('contract_sha256')}`"]
@@ -871,6 +1003,8 @@ def render_evidence_md(ev: dict) -> str:
                      + (f" (pre-approval changes: {len(ap.get('pre_approval_changes') or [])})" if ap.get("pre_approval_changes") else ""))
     else:
         lines.append("- approval: **none**")
+    if ev.get("error"):
+        lines.append(f"- error: {ev['error']}")
     if ev.get("paused"):
         lines.append(f"- paused: {ev['paused'].get('reason')} ({ev['paused'].get('at')})")
     if ev.get("released"):
@@ -883,7 +1017,7 @@ def render_evidence_md(ev: dict) -> str:
         lines.append("| item | status | strength | exit | time | check |")
         lines.append("|---|---|---|---|---|---|")
         for it in ev["items"]:
-            exit_s = "timeout" if it.get("timed_out") else ("not run" if it["status"] == "ERROR" else str(it.get("exit")))
+            exit_s = "timeout" if it.get("timed_out") else ("not run" if it["status"] == "ERROR" and it.get("exit") is None else str(it.get("exit")))
             flag = " (cached)" if it.get("reused") else ""
             lines.append(f"| {it['id']} {it['text']} | {it['status']}{flag} | {it['strength']} | {exit_s} | {it.get('duration_s')}s | `{it['command']}` |")
         for it in ev["items"]:
@@ -897,7 +1031,7 @@ def render_evidence_md(ev: dict) -> str:
         lines.append("")
         lines.append("repo checks:")
         for rc in ev["repo_checks"]:
-            lines.append(f"- {rc['status']} `{rc['command']}` exit {rc.get('exit')} {rc.get('duration_s')}s" + (" (cached)" if rc.get("reused") else ""))
+            lines.append(f"- {rc['status']} `{rc['command']}` exit {rc.get('exit')} {rc.get('duration_s')}s" + (f" error: {rc['error']}" if rc.get("error") else ""))
     if ev.get("protected_changed"):
         lines.append("")
         lines.append("protected paths changed since baseline" + (" (allowed)" if ev.get("allow_protected_changes") else " (**blocks**)") + ":")
@@ -925,31 +1059,37 @@ def summarize_evidence(ev: dict) -> str:
 
 
 def close_contract(repo: Path, task: str) -> dict:
+    """Close only on a fresh run made under the lock (opt-in cached items may be reused)."""
     with repo_lock(repo):
-        contract = load_contract(repo, task)
         marks = load_marks(repo, task)
         if marks.get("closed_at"):
             raise DoneContractError("already closed")
-        ev = load_evidence(repo, task)
-        tree = working_tree_hash(repo)
-        if not evidence_is_current(repo, task, ev, contract, marks, tree) or ev.get("verdict") not in ALLOW_STOP_VERDICTS:
-            raise DoneContractError(
-                "close needs current evidence (same contract, approval, marks and tree) with verdict PASS, INCOMPLETE or PAUSED; "
-                "run `done-contract check` first")
+        if contract_state(repo, task) != "approved":
+            raise DoneContractError(f"contract is {contract_state(repo, task)}; only an approved contract can be closed")
+        ev = _run_check_locked(repo, task, reuse=True, session=None, budget_s=None)
+        if ev.get("verdict") not in ALLOW_STOP_VERDICTS:
+            raise DoneContractError(f"close refused: fresh check verdict is {ev.get('verdict')} "
+                                    "(needs PASS, INCOMPLETE or PAUSED); see evidence.md")
+        marks = load_marks(repo, task)
         marks["closed_at"] = now_iso()
         marks["closed_verdict"] = ev["verdict"]
         save_marks(repo, task, marks)
         if active_task(repo) == task:
             set_active(repo, None)
-    log_event({"event": "close", "repo": str(repo), "task": task, "verdict": ev.get("verdict"), "tree": tree})
+    log_event({"event": "close", "repo": str(repo), "task": task, "verdict": ev.get("verdict"), "tree": ev.get("tree")})
     return ev
 
 
 def verify_evidence(repo: Path, task: str) -> dict:
-    """Re-run every command recorded in the evidence (no cache) and compare statuses."""
+    """Re-run every command recorded in the evidence (same timeouts, no cache) and compare.
+
+    `agree` is about reproduction. `current` says whether the evidence still describes
+    this contract, approval, marks and tree; both must hold to trust it as a receipt."""
     ev = load_evidence(repo, task)
-    if not ev or ev.get("verdict") in (VERDICT_UNAPPROVED, None):
-        raise DoneContractError("no evidence to verify; run `done-contract check` first")
+    if not ev or ev.get("verdict") in (VERDICT_UNAPPROVED, None) or ev.get("in_progress"):
+        raise DoneContractError("no finished evidence to verify; run `done-contract check` first")
+    contract = load_contract(repo, task)
+    marks = load_marks(repo, task)
     tree = working_tree_hash(repo)
     rows = []
     agree = True
@@ -958,18 +1098,24 @@ def verify_evidence(repo: Path, task: str) -> dict:
             rows.append({"id": it["id"], "recorded": "ERROR", "now": "skipped", "agree": False, "exit": None})
             agree = False
             continue
-        res = run_command(it["command"], repo, 300)
-        passed = res["exit"] == 0 and not res["timed_out"] and (not it.get("expect") or it["expect"] in res["output_tail"])
-        recorded = it["status"]
+        res = run_command(it["command"], repo, it.get("timeout_s") or DEFAULT_ITEM_TIMEOUT, expect=it.get("expect"))
+        passed = res["exit"] == 0 and not res["timed_out"] and (res["expect_matched"] is not False)
         now = "PASS" if passed else "FAIL"
-        same = (recorded == "PASS") == passed
+        same = (it["status"] == "PASS") == passed
         agree = agree and same
-        rows.append({"id": it["id"], "recorded": recorded, "now": now, "agree": same, "exit": res["exit"]})
+        rows.append({"id": it["id"], "recorded": it["status"], "now": now, "agree": same, "exit": res["exit"]})
     for rc in ev.get("repo_checks", []):
-        res = run_command(rc["command"], repo, 900)
+        res = run_command(rc["command"], repo, rc.get("timeout_s") or REPO_CHECK_TIMEOUT)
         now = "PASS" if res["exit"] == 0 and not res["timed_out"] else "FAIL"
         same = rc["status"] == now
         agree = agree and same
         rows.append({"id": f"repo:{rc['command']}", "recorded": rc["status"], "now": now, "agree": same, "exit": res["exit"]})
+    hmac_valid = ev.get("hmac") == sign_evidence(ev)
+    current = evidence_is_current(repo, task, ev, contract, marks, tree)
     return {"task": task, "evidence_tree": ev.get("tree"), "current_tree": tree, "same_tree": ev.get("tree") == tree,
-            "hmac_valid": ev.get("hmac") == sign_evidence(ev), "rows": rows, "agree": agree}
+            "hmac_valid": hmac_valid, "current": current, "rows": rows, "agree": agree,
+            "ok": agree and hmac_valid and current}
+
+
+def shell_quote(path: str) -> str:
+    return shlex.quote(path)

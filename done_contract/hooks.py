@@ -26,9 +26,19 @@ STOP_BUDGET_DEFAULT_S = 840  # below the 900 s hook timeout installed by `hook i
 APPROVE_RE = re.compile(r"done-contract\s+approve\b|\.done-contract[/\\]approved|DONE_CONTRACT_APPROVE_NO_TTY|DONE_CONTRACT_HOME")
 STATE_PATH_RE = re.compile(r"\.done-contract[/\\]")
 WRITE_HINT_RE = re.compile(
-    r"(?<![2&])>(?!/dev/null)|\btee\b|\bsed\s+-i\b|(^|[;&|(]\s*)(sudo\s+)?(rm|mv|cp|truncate|chmod|ln|touch|install)\b"
-    r"|\bgit\s+(rm|checkout|restore|mv|clean|stash|apply|am|cherry-pick|merge|rebase|reset)\b|\bpython3?\s+-c\b|\bperl\s+-[pi]\b|\bpatch\b")
-DONE_CONTRACT_CMD_RE = re.compile(r"(^|[;&|]\s*)(\S*/)?done-contract\s+(init|status|check|mark|pause|resume|verify|version|close)\b")
+    r"(?<![2&<])>(?!/dev/null)|\btee\b|\bsed\s+-i\b|(^\s*|[;&|(]\s*)(sudo\s+)?(rm|rmdir|mv|cp|truncate|chmod|chown|ln|touch|install|mkdir|dd)\b"
+    r"|\bgit\s+(rm|checkout|restore|mv|clean|stash|apply|am|cherry-pick|merge|rebase|reset|commit|pull)\b"
+    r"|\b(python3?|perl)\s+-[ciwp]\b|\bpatch\b|\bnpm\s+(i|install|ci|update|uninstall)\b|\bpip3?\s+install\b|\bcargo\s+(add|install)\b")
+INTERPRETER_RE = re.compile(r"(^\s*|[;&|(]\s*)(sudo\s+)?(python3?|node|ruby|perl|php|sh|bash|zsh|env|nohup|xargs|eval|exec|source|\.)\b")
+HEREDOC_RE = re.compile(r"<<-?\s*['\"]?\w+")
+READ_ONLY_RE = re.compile(
+    r"^\s*(cat|ls|ll|head|tail|less|more|wc|grep|rg|egrep|fgrep|find|fd|stat|file|which|type|pwd|echo|printf|env|printenv|date|"
+    r"whoami|id|uname|tree|du|df|diff|cmp|md5|md5sum|shasum|sha256sum|jq|yq|sort|uniq|cut|awk|sed|tr|column|basename|dirname|"
+    r"realpath|readlink|true|false|test|\[|git\s+(status|log|diff|show|branch|rev-parse|ls-files|blame|describe|remote|tag|"
+    r"stash\s+list|config\s+(--get|-l|--list))|python3?\s+-m\s+(pytest|unittest|json\.tool)|pytest|npm\s+(test|run\s+test|ls)|"
+    r"pnpm\s+test|yarn\s+test|cargo\s+(test|check|clippy)|go\s+(test|vet|build)|make\s+(test|check)|mypy|pyright|ruff|eslint|tsc)\b")
+DONE_CONTRACT_CMD_RE = re.compile(r"(^\s*|[;&|]\s*)(\S*/)?done-contract\s+(init|status|check|mark|pause|resume|verify|version|close)\b")
+SEGMENT_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;|\|)\s*")
 
 
 def _safe_name(value: str) -> str:
@@ -94,7 +104,7 @@ def _item_lines(ev: dict) -> list[str]:
             lines.extend("    " + t for t in tail)
     for rc in ev.get("repo_checks", []):
         if rc["status"] != "PASS":
-            lines.append(f"- repo check {rc['status']} (exit {rc.get('exit')}): {rc['command']}")
+            lines.append(f"- repo check {rc['status']} (exit {rc.get('exit')}): {rc['command']}" + (f" — {rc['error']}" if rc.get("error") else ""))
             tail = (rc.get("output_tail") or "").strip().splitlines()[-12:]
             lines.extend("    " + t for t in tail)
     if ev.get("protected_changed") and not ev.get("allow_protected_changes"):
@@ -120,6 +130,10 @@ def _block_reason(task: str, ev: dict, blocks: int, max_blocks: int) -> str:
     return "\n".join(lines)
 
 
+def _with_log_note(message: str, logged: bool) -> str:
+    return message if logged else message + " (경고: 결정 로그 기록 실패)"
+
+
 def stop(payload: dict, *, require_contract: bool = False) -> dict | None:
     repo, task = _repo_and_task(payload)
     if repo is None:
@@ -135,23 +149,28 @@ def stop(payload: dict, *, require_contract: bool = False) -> dict | None:
     if state_name in ("closed", "abandoned"):
         return None
     if state_name == "draft":
-        core.log_event({"event": "stop", "repo": str(repo), "task": task, "session": session, "decision": "allow", "why": "unapproved"})
-        return {"systemMessage": f"done-contract: 계약 '{task}'은 아직 승인되지 않았다. 사람이 `done-contract approve`를 실행하기 전까지 완료 게이트는 꺼져 있다"
-                                 + (" (require-contract: 파일 변경은 거부된다)." if require_contract else ".")}
+        logged = core.log_event({"event": "stop", "repo": str(repo), "task": task, "session": session, "decision": "allow", "why": "unapproved"})
+        return {"systemMessage": _with_log_note(
+            f"done-contract: 계약 '{task}'은 아직 승인되지 않았다. 사람이 `done-contract approve`를 실행하기 전까지 완료 게이트는 꺼져 있다"
+            + (" (require-contract: 파일 변경은 거부된다)." if require_contract else "."), logged)}
     max_blocks = _max_blocks()
     key = f"{session}__{task}__{core.contract_sha(contract)[:16]}"
     state = _load_state(key)
-    if state["blocks"] >= max_blocks:
-        ev = core.mark_released(repo, task, "block_cap", session)
-        core.log_event({"event": "stop", "repo": str(repo), "task": task, "session": session, "decision": "release", "why": "cap",
-                        "verdict": (ev or {}).get("verdict")})
-        detail = "; ".join(_item_lines(ev)[:6]) if ev else ""
-        return {"systemMessage": f"done-contract: 차단 상한({max_blocks})에 도달해 통과시킨다. 계약 '{task}'은 완료가 아니다"
-                                 f" (마지막 판정 {(ev or {}).get('verdict')}). {detail}"}
     ev = core.run_check(repo, task, reuse=True, session=session, budget_s=_budget())
     if ev["verdict"] in core.ALLOW_STOP_VERDICTS:
-        core.log_event({"event": "stop", "repo": str(repo), "task": task, "session": session, "decision": "allow", "verdict": ev["verdict"], "tree": ev.get("tree")})
-        return {"systemMessage": core.summarize_evidence(ev)}
+        state["blocks"] = 0
+        state["last_verdict"] = ev["verdict"]
+        _save_state(key, state)
+        logged = core.log_event({"event": "stop", "repo": str(repo), "task": task, "session": session, "decision": "allow",
+                                 "verdict": ev["verdict"], "tree": ev.get("tree")})
+        return {"systemMessage": _with_log_note(core.summarize_evidence(ev), logged)}
+    if state["blocks"] >= max_blocks:
+        released = core.mark_released(repo, task, "block_cap", session) or ev
+        logged = core.log_event({"event": "stop", "repo": str(repo), "task": task, "session": session, "decision": "release",
+                                 "why": "cap", "verdict": ev["verdict"], "tree": ev.get("tree")})
+        detail = "; ".join(_item_lines(released)[:6])
+        return {"systemMessage": _with_log_note(
+            f"done-contract: 차단 상한({max_blocks})에 도달해 통과시킨다. 계약 '{task}'은 완료가 아니다 (판정 {ev['verdict']}). {detail}", logged)}
     state["blocks"] = int(state["blocks"]) + 1
     state["last_verdict"] = ev["verdict"]
     state["last_tree"] = ev.get("tree")
@@ -169,14 +188,48 @@ def _ask(reason: str) -> dict:
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask", "permissionDecisionReason": reason}}
 
 
-def _rel_path(repo: Path, fp: str) -> str | None:
-    p = Path(fp)
-    if not p.is_absolute():
-        p = repo / p
-    try:
-        return p.resolve().relative_to(repo.resolve()).as_posix()
-    except ValueError:
+def _payload_cwd(payload: dict, repo: Path) -> Path:
+    cwd = payload.get("cwd")
+    return Path(cwd) if cwd else repo
+
+
+def _edit_target(payload: dict, repo: Path) -> tuple[str | None, str | None] | None:
+    inp = payload.get("tool_input") or {}
+    fp = inp.get("file_path") or inp.get("notebook_path")
+    if not fp:
         return None
+    return core.repo_relative(repo, fp, _payload_cwd(payload, repo))
+
+
+def _protected_hit(lexical: str | None, resolved: str | None, protected: list[str]) -> str | None:
+    for rel in (lexical, resolved):
+        if rel and core.matches_any(rel, protected):
+            return rel
+    return None
+
+
+def _bash_policy_without_contract(cmd: str) -> dict | None:
+    if APPROVE_RE.search(cmd):
+        return _deny("done-contract: 에이전트는 계약을 승인할 수 없다. 사람에게 `done-contract approve`를 부탁하라.")
+    if HEREDOC_RE.search(cmd):
+        return _deny("done-contract: 승인된 계약 없이는 heredoc 스크립트를 실행할 수 없다(require-contract).")
+    if DONE_CONTRACT_CMD_RE.search(cmd) and not WRITE_HINT_RE.search(cmd):
+        return None
+    unknown = False
+    for seg in SEGMENT_SPLIT_RE.split(cmd):
+        if not seg.strip():
+            continue
+        if WRITE_HINT_RE.search(seg):
+            return _deny("done-contract: 승인된 계약 없이는 파일을 바꾸는 명령을 실행할 수 없다(require-contract). "
+                         "`done-contract init`으로 계약 초안을 쓰고 사람에게 `done-contract approve`를 부탁하라.")
+        if READ_ONLY_RE.match(seg):
+            continue
+        if INTERPRETER_RE.match(seg):
+            return _deny("done-contract: 승인된 계약 없이는 스크립트 실행 명령을 쓸 수 없다(require-contract).")
+        unknown = True
+    if unknown:
+        return _ask("done-contract: 승인된 계약이 없다(require-contract). 이 명령이 파일을 바꾸지 않는지 사람이 정한다.")
+    return None
 
 
 def pretool(payload: dict, *, require_contract: bool = False) -> dict | None:
@@ -191,59 +244,58 @@ def pretool(payload: dict, *, require_contract: bool = False) -> dict | None:
     if not gate_on:
         if not require_contract:
             return None
-        # policy: no approved contract -> no mutations, except drafting the contract itself
         if tool in EDIT_TOOLS:
-            fp = inp.get("file_path") or inp.get("notebook_path")
-            rel = _rel_path(repo, fp) if fp else None
-            if rel and task and rel == f"{core.CONTRACT_DIRNAME}/{task}/contract.json" and state_name == "draft":
+            target = _edit_target(payload, repo)
+            if target is None:
                 return None
-            if rel is None:
+            lexical, resolved = target
+            if lexical is None and resolved is None:
+                return None
+            if task and state_name == "draft" and lexical == f"{core.CONTRACT_DIRNAME}/{task}/contract.json":
                 return None
             return _deny("done-contract: 이 저장소는 승인된 계약 없이는 파일을 바꿀 수 없다(require-contract). "
                          "`done-contract init`으로 계약 초안을 쓰고 사람에게 `done-contract approve`를 부탁하라.")
         if tool == "Bash":
-            cmd = str(inp.get("command") or "")
-            if APPROVE_RE.search(cmd):
-                return _deny("done-contract: 에이전트는 계약을 승인할 수 없다. 사람에게 `done-contract approve`를 부탁하라.")
-            if DONE_CONTRACT_CMD_RE.search(cmd) and not WRITE_HINT_RE.search(cmd):
-                return None
-            if WRITE_HINT_RE.search(cmd):
-                return _deny("done-contract: 승인된 계약 없이는 파일을 바꾸는 명령을 실행할 수 없다(require-contract).")
+            return _bash_policy_without_contract(str(inp.get("command") or ""))
         return None
     protected = contract.get("protected", [])
     allow = bool(contract.get("allow_protected_changes"))
     if tool in EDIT_TOOLS:
-        fp = inp.get("file_path") or inp.get("notebook_path")
-        if not fp:
+        target = _edit_target(payload, repo)
+        if target is None:
             return None
-        rel = _rel_path(repo, fp)
-        if rel is None:
+        lexical, resolved = target
+        if lexical is None and resolved is None:
             return None
-        if rel == f"{core.CONTRACT_DIRNAME}/{task}/contract.json":
+        if lexical == f"{core.CONTRACT_DIRNAME}/{task}/contract.json":
             return _deny(f"done-contract: 승인된 계약 '{task}'은 변경할 수 없다. 기준을 바꾸려면 사람에게 새 revision 승인을 요청하라.")
-        if rel.startswith(f"{core.CONTRACT_DIRNAME}/"):
+        if (lexical or "").startswith(f"{core.CONTRACT_DIRNAME}/") or (resolved or "").startswith(f"{core.CONTRACT_DIRNAME}/"):
             return _deny("done-contract: 증빙·상태 파일은 도구 명령(mark, pause, check)으로만 바꾼다.")
-        if not allow and core.matches_any(rel, protected):
-            return _deny(f"done-contract: '{rel}'은 계약 '{task}'의 보호 경로다. 테스트 대신 테스트 대상 코드를 고쳐라. "
+        hit = None if allow else _protected_hit(lexical, resolved, protected)
+        if hit:
+            return _deny(f"done-contract: '{hit}'은 계약 '{task}'의 보호 경로다. 테스트 대신 테스트 대상 코드를 고쳐라. "
                          "테스트 변경이 작업에 포함되면 사람에게 allow_protected_changes 재승인을 요청하라.")
         return None
     if tool == "Bash":
         cmd = str(inp.get("command") or "")
         if APPROVE_RE.search(cmd):
             return _deny("done-contract: 에이전트는 계약을 승인하거나 done-contract 승인 상태를 만질 수 없다. 사람에게 `done-contract approve`를 부탁하라.")
-        if STATE_PATH_RE.search(cmd) and WRITE_HINT_RE.search(cmd):
+        if STATE_PATH_RE.search(cmd) and (WRITE_HINT_RE.search(cmd) or HEREDOC_RE.search(cmd)):
             return _deny("done-contract: .done-contract 상태 파일은 도구 명령(mark, pause, check)으로만 바꾼다.")
-        if not allow and WRITE_HINT_RE.search(cmd):
+        if not allow and (WRITE_HINT_RE.search(cmd) or HEREDOC_RE.search(cmd)):
             try:
                 tokens = shlex.split(cmd, posix=True)
             except ValueError:
                 tokens = cmd.split()
+            cwd = _payload_cwd(payload, repo)
             for tok in tokens:
                 t = tok.strip("'\"")
-                while t.startswith("./"):
-                    t = t[2:]
-                if t and core.matches_any(t, protected):
-                    return _ask(f"done-contract: 이 명령은 보호 경로 '{t}'를 바꿀 수 있다(계약 '{task}'). 허용할지 사람이 정한다.")
+                if not t or t.startswith("-"):
+                    continue
+                lexical, resolved = core.repo_relative(repo, t, cwd) if ("/" in t or t.startswith(".")) or os.path.exists(cwd / t) else (core.normalize_rel(t), None)
+                hit = _protected_hit(lexical, resolved, protected)
+                if hit:
+                    return _ask(f"done-contract: 이 명령은 보호 경로 '{hit}'를 바꿀 수 있다(계약 '{task}'). 허용할지 사람이 정한다.")
         return None
     return None
 

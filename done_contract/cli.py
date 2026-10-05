@@ -115,6 +115,7 @@ def cmd_status(args) -> int:
         print(f"closed_at: {marks['closed_at']} with verdict {marks.get('closed_verdict')}")
     if ev:
         print(f"last evidence: {ev.get('verdict')} at {ev.get('checked_at')} tree {str(ev.get('tree'))[:12]}"
+              + (" (in progress / interrupted)" if ev.get("in_progress") else "")
               + (f"  released: {ev['released'].get('reason')}" if ev.get("released") else ""))
     else:
         print("last evidence: none")
@@ -137,35 +138,37 @@ def cmd_verify(args) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         print(f"evidence tree {str(result['evidence_tree'])[:12]} current {str(result['current_tree'])[:12]} "
-              f"same_tree={result['same_tree']} hmac_valid={result['hmac_valid']}")
+              f"same_tree={result['same_tree']} hmac_valid={result['hmac_valid']} current={result['current']}")
         for row in result["rows"]:
             print(f"  {row['id']}: recorded {row['recorded']} now {row['now']} {'OK' if row['agree'] else 'MISMATCH'}")
-        print("agree" if result["agree"] else "MISMATCH")
-    return 0 if result["agree"] and result["hmac_valid"] else 1
+        print("ok: reproduced and current" if result["ok"] else ("reproduced but NOT current" if result["agree"] and result["hmac_valid"] else "MISMATCH"))
+    return 0 if result["ok"] else 1
 
 
 def hook_snippet(bin_path: str, require_contract: bool = False) -> dict:
     flag = " --require-contract" if require_contract else ""
+    quoted = core.shell_quote(bin_path)
     return {
         "hooks": {
-            "Stop": [{"hooks": [{"type": "command", "command": f"{bin_path} hook stop{flag}", "timeout": HOOK_EVENTS["Stop"]["timeout"]}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": f"{quoted} hook stop{flag}", "timeout": HOOK_EVENTS["Stop"]["timeout"]}]}],
             "PreToolUse": [{"matcher": HOOK_EVENTS["PreToolUse"]["matcher"],
-                            "hooks": [{"type": "command", "command": f"{bin_path} hook pretool{flag}", "timeout": HOOK_EVENTS["PreToolUse"]["timeout"]}]}],
+                            "hooks": [{"type": "command", "command": f"{quoted} hook pretool{flag}", "timeout": HOOK_EVENTS["PreToolUse"]["timeout"]}]}],
         }
     }
 
 
+def _is_ours(group: dict, kind: str) -> bool:
+    return any("done-contract" in str(h.get("command", "")) and kind in str(h.get("command", "")) for h in group.get("hooks", []))
+
+
 def merge_hooks(settings: dict, snippet: dict) -> dict:
+    """Install or upgrade our hook groups; other tools' hooks are preserved untouched."""
     hooks_cfg = settings.setdefault("hooks", {})
     for event, groups in snippet["hooks"].items():
-        existing = hooks_cfg.setdefault(event, [])
         kind = "hook stop" if event == "Stop" else "hook pretool"
-        for group in groups:
-            already = any(
-                any("done-contract" in str(h.get("command", "")) and kind in str(h.get("command", "")) for h in g.get("hooks", []))
-                for g in existing)
-            if not already:
-                existing.append(group)
+        existing = [g for g in hooks_cfg.get(event, []) if not _is_ours(g, kind)]
+        existing.extend(groups)
+        hooks_cfg[event] = existing
     return settings
 
 
@@ -188,6 +191,11 @@ def cmd_hook(args) -> int:
         merge_hooks(settings, snippet)
         core.write_json(settings_path, settings)
         print(f"hooks merged into {settings_path}")
+        for event in ("Stop", "PreToolUse"):
+            for g in settings["hooks"].get(event, []):
+                for h in g.get("hooks", []):
+                    if "done-contract" in str(h.get("command", "")):
+                        print(f"  {event}: {h['command']}  (timeout {h.get('timeout')})")
         return 0
     return 2
 
@@ -218,8 +226,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("check", help="run every item check and write evidence (exit 0 only for PASS)")
     s.add_argument("--task")
     s.add_argument("--json", action="store_true")
-    s.add_argument("--no-reuse", action="store_true", help="re-run even cacheable items")
-    s.add_argument("--budget", type=float, help="seconds; items not started within the budget are ERROR")
+    s.add_argument("--no-reuse", action="store_true", help="re-run even items marked cache:true")
+    s.add_argument("--budget", type=float, help="seconds; the whole run, including running commands, stops at this deadline")
     s.set_defaults(func=cmd_check)
 
     s = sub.add_parser("mark", help="mark an item blocked (with reason) or open")
@@ -243,7 +251,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_status)
 
-    s = sub.add_parser("close", help="close the task; needs current evidence with PASS/INCOMPLETE/PAUSED (exit 0 only for PASS)")
+    s = sub.add_parser("close", help="re-run the checks under the lock and close the task (exit 0 only for PASS)")
     s.add_argument("--task")
     s.set_defaults(func=cmd_close)
 
@@ -275,3 +283,6 @@ def main(argv: list[str] | None = None) -> int:
     except core.DoneContractError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except Exception as exc:  # infrastructure failure: never report success
+        print(f"error (internal): {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 5

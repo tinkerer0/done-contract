@@ -1,10 +1,13 @@
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -53,7 +56,7 @@ class Base(unittest.TestCase):
     def approve(self, task="task-1", **kw):
         os.environ["DONE_CONTRACT_APPROVE_NO_TTY"] = "1"
         try:
-            return core.approve_contract(self.repo, task, **kw)
+            return core.approve_contract(self.repo, task, stdout=io.StringIO(), **kw)
         finally:
             os.environ.pop("DONE_CONTRACT_APPROVE_NO_TTY", None)
 
@@ -84,18 +87,15 @@ class TestLintAndGlobs(Base):
         c["items"] = []
         self.assertIn("items must be a non-empty list", "\n".join(core.lint_contract(c)))
 
-    def test_strength_and_cacheability(self):
+    def test_strength_is_info_only_and_cache_is_opt_in(self):
         self.assertEqual(core.strength_of("pytest -q tests"), "test")
-        self.assertEqual(core.strength_of("npm test"), "test")
-        self.assertEqual(core.strength_of("cargo test --lib physics"), "test")
+        self.assertEqual(core.strength_of("pytest -q && curl -f http://x"), "http")  # compound: weakest wins
         self.assertEqual(core.strength_of("test -f docs/x.md"), "existence")
         self.assertEqual(core.strength_of("grep -q RATE docs/x.md"), "content")
-        self.assertEqual(core.strength_of("curl -fsS http://localhost:8080/health"), "http")
         self.assertEqual(core.strength_of("./scripts/smoke.sh"), "other")
-        self.assertTrue(core.item_cacheable({"check": "pytest -q"}))
-        self.assertFalse(core.item_cacheable({"check": "curl -f http://x"}))
-        self.assertFalse(core.item_cacheable({"check": "./scripts/smoke.sh"}))
+        self.assertFalse(core.item_cacheable({"check": "pytest -q"}))
         self.assertFalse(core.item_cacheable({"check": "pytest -q", "cache": False}))
+        self.assertTrue(core.item_cacheable({"check": "pytest -q", "cache": True}))
 
     def test_globs(self):
         self.assertTrue(core.matches_any("tests/test_x.py", core.DEFAULT_PROTECTED))
@@ -106,6 +106,20 @@ class TestLintAndGlobs(Base):
         self.assertTrue(core.matches_any("./tests/x.py", core.DEFAULT_PROTECTED))
         self.assertFalse(core.matches_any("src/app.py", core.DEFAULT_PROTECTED))
         self.assertFalse(core.matches_any("docs/testing.md", core.DEFAULT_PROTECTED))
+
+    def test_repo_relative_paths(self):
+        lex, res = core.repo_relative(self.repo, "fixture.txt", self.repo / "tests")
+        self.assertEqual(lex, "tests/fixture.txt")
+        lex, res = core.repo_relative(self.repo, str(self.repo / "tests" / "x.py"))
+        self.assertEqual((lex, res), ("tests/x.py", "tests/x.py"))
+        lex, res = core.repo_relative(self.repo, "/etc/hosts")
+        self.assertEqual((lex, res), (None, None))
+        outside = Path(self.tmp.name) / "outside.py"
+        outside.write_text("x")
+        (self.repo / "tests" / "test_link.py").symlink_to(outside)
+        lex, res = core.repo_relative(self.repo, "tests/test_link.py")
+        self.assertEqual(lex, "tests/test_link.py")
+        self.assertIsNone(res)
 
 
 class TestTreeHash(Base):
@@ -122,24 +136,58 @@ class TestTreeHash(Base):
         status = subprocess.run(["git", "status", "--porcelain"], cwd=self.repo, capture_output=True, text=True).stdout
         self.assertIn("?? new.txt", status)  # the user's real index is untouched
 
+    def test_changed_paths_handle_non_ascii_and_renames(self):
+        (self.repo / "tests" / "검사.py").write_text("x\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "korean")
+        t0 = core.working_tree_hash(self.repo)
+        (self.repo / "tests" / "검사.py").write_text("y\n")
+        t1 = core.working_tree_hash(self.repo)
+        self.assertEqual(core.changed_paths(self.repo, t0, t1), ["tests/검사.py"])
+        git(self.repo, "config", "diff.renames", "true")
+        (self.repo / "tests" / "test_a.py").rename(self.repo / "gone.py")
+        t2 = core.working_tree_hash(self.repo)
+        self.assertEqual(sorted(core.changed_paths(self.repo, t1, t2)), ["gone.py", "tests/test_a.py"])
+
     def test_done_contract_dir_is_excluded(self):
         core.init_contract(self.repo, "task-1", "r")
         t0 = core.working_tree_hash(self.repo)
         (self.repo / ".done-contract" / "scratch.txt").write_text("x")
         self.assertEqual(t0, core.working_tree_hash(self.repo))
 
+    def test_git_file_layout(self):
+        """Repositories whose .git is a file (separate git dir, linked worktrees)."""
+        other = Path(self.tmp.name) / "gitfile-repo"
+        gitdir = Path(self.tmp.name) / "gitdir"
+        other.mkdir()
+        git(other, "init", "-q", "-b", "main", f"--separate-git-dir={gitdir}")
+        git(other, "config", "user.email", "t@example.com")
+        git(other, "config", "user.name", "t")
+        (other / "a.txt").write_text("a")
+        git(other, "add", "-A")
+        git(other, "commit", "-q", "-m", "init")
+        other = other.resolve()
+        self.assertTrue((other / ".git").is_file())
+        c = core.init_contract(other, "t", "req")
+        c["items"] = [{"id": "Q1", "text": "a", "check": "test -f a.txt"}]
+        core.write_json(core.task_dir(other, "t") / "contract.json", c)
+        os.environ["DONE_CONTRACT_APPROVE_NO_TTY"] = "1"
+        core.approve_contract(other, "t", stdout=io.StringIO())
+        self.assertEqual(core.run_check(other, "t")["verdict"], core.VERDICT_PASS)
+        self.assertEqual(core.close_contract(other, "t")["verdict"], core.VERDICT_PASS)
+
 
 class TestApproval(Base):
     def test_approve_requires_tty(self):
         self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}])
         with self.assertRaises(core.NotInteractive):
-            core.approve_contract(self.repo, "task-1")
+            core.approve_contract(self.repo, "task-1", stdout=io.StringIO())
 
     def test_approve_refuses_lint_failure(self):
         self.make_contract([{"id": "Q1", "text": "a", "check": "true"}])
         os.environ["DONE_CONTRACT_APPROVE_NO_TTY"] = "1"
         with self.assertRaises(core.DoneContractError):
-            core.approve_contract(self.repo, "task-1")
+            core.approve_contract(self.repo, "task-1", stdout=io.StringIO())
 
     def test_approval_is_bound_to_contract_hash(self):
         c = self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}])
@@ -162,9 +210,26 @@ class TestApproval(Base):
         ev = core.run_check(self.repo, "task-1")
         self.assertEqual(ev["approval"]["pre_approval_changes"], ["early.py"])
 
+    def test_approve_rechecks_tree_after_the_person_answers(self):
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}])
+        repo = self.repo
+
+        class RacingStdin(io.StringIO):
+            def isatty(self):
+                return True
+
+            def readline(self):
+                (repo / "new.py").write_text("sneaky\n")
+                return "y\n"
+
+        with self.assertRaises(core.DoneContractError) as ctx:
+            core.approve_contract(self.repo, "task-1", stdin=RacingStdin(), stdout=io.StringIO())
+        self.assertIn("new.py", str(ctx.exception))
+        self.assertEqual(core.contract_state(self.repo, "task-1"), "draft")
+
 
 class TestCheck(Base):
-    def test_fail_then_pass_and_reuse(self):
+    def test_fail_then_pass_no_cache_by_default(self):
         self.make_contract([
             {"id": "Q1", "text": "readme", "check": "test -f README.md"},
             {"id": "Q2", "text": "docs", "check": "grep -q RATE docs/config.md"},
@@ -177,18 +242,17 @@ class TestCheck(Base):
         (self.repo / "docs" / "config.md").write_text("RATE_LIMIT=5\n")
         ev2 = core.run_check(self.repo, "task-1")
         self.assertEqual(ev2["verdict"], core.VERDICT_PASS)
-        self.assertFalse(ev2["reused"])
         self.assertEqual(ev2["hmac"], core.sign_evidence(ev2))
         ev3 = core.run_check(self.repo, "task-1")
-        self.assertTrue(ev3["reused"])
-        self.assertTrue(all(i["reused"] for i in ev3["items"]))
+        self.assertFalse(ev3["reused"])
+        self.assertFalse(any(i["reused"] for i in ev3["items"]))
         self.assertTrue((core.task_dir(self.repo, "task-1") / "evidence.md").exists())
 
-    def test_external_checks_are_never_cached(self):
-        marker = self.repo.parent / "service_up"
+    def test_opt_in_cache_reuses_only_marked_items(self):
+        marker = Path(self.tmp.name) / "service_up"
         marker.write_text("1")
-        self.make_contract([{"id": "Q1", "text": "svc", "check": f"curl --version >/dev/null 2>&1; test -f {marker}"},
-                            {"id": "Q2", "text": "local", "check": "test -f README.md"}])
+        self.make_contract([{"id": "Q1", "text": "svc", "check": f"test -f {marker}"},
+                            {"id": "Q2", "text": "local", "check": "test -f README.md", "cache": True}])
         self.approve()
         ev = core.run_check(self.repo, "task-1")
         self.assertEqual(ev["verdict"], core.VERDICT_PASS)
@@ -198,22 +262,58 @@ class TestCheck(Base):
         self.assertFalse(ev2["items"][0]["reused"])
         self.assertTrue(ev2["items"][1]["reused"])
         self.assertEqual(ev2["verdict"], core.VERDICT_FAIL)
+        ev3 = core.run_check(self.repo, "task-1", reuse=False)
+        self.assertFalse(ev3["items"][1]["reused"])
 
-    def test_expect_substring(self):
-        self.make_contract([{"id": "Q1", "text": "a", "check": "cat README.md", "expect": "hello"},
+    def test_symlinked_external_input_is_not_cached_by_default(self):
+        marker = Path(self.tmp.name) / "ext"
+        marker.write_text("1")
+        (self.repo / "ready").symlink_to(marker)
+        self.make_contract([{"id": "Q1", "text": "ready", "check": "test -f ready"}])
+        self.approve()
+        self.assertEqual(core.run_check(self.repo, "task-1")["verdict"], core.VERDICT_PASS)
+        marker.unlink()
+        self.assertEqual(core.run_check(self.repo, "task-1")["verdict"], core.VERDICT_FAIL)
+
+    def test_expect_runs_once_and_searches_full_output(self):
+        counter = Path(self.tmp.name) / "runs"
+        self.make_contract([{"id": "Q1", "text": "a", "check": f"echo run >> {counter}; printf 'EXPECTED\\n'; seq 1 500", "expect": "EXPECTED"},
                             {"id": "Q2", "text": "b", "check": "cat README.md", "expect": "nope"}])
         self.approve()
         ev = core.run_check(self.repo, "task-1")
         self.assertEqual([i["status"] for i in ev["items"]], ["PASS", "FAIL"])
+        self.assertTrue(ev["items"][0]["expect_matched"])
         self.assertFalse(ev["items"][1]["expect_matched"])
+        self.assertEqual(counter.read_text().count("run"), 1)
+        v = core.verify_evidence(self.repo, "task-1")
+        self.assertTrue(all(r["agree"] for r in v["rows"]))
 
     def test_timeout_is_fail_and_kills_children(self):
-        self.make_contract([{"id": "Q1", "text": "slow", "check": "sleep 30 & sleep 30", "timeout": 1}])
+        pidfile = Path(self.tmp.name) / "child.pid"
+        self.make_contract([{"id": "Q1", "text": "slow", "check": f"sleep 60 & echo $! > {pidfile}; wait", "timeout": 1}])
         self.approve()
         ev = core.run_check(self.repo, "task-1")
         self.assertEqual(ev["verdict"], core.VERDICT_FAIL)
         self.assertTrue(ev["items"][0]["timed_out"])
         self.assertLess(ev["items"][0]["duration_s"], 10)
+        pid = int(pidfile.read_text().strip())
+        time.sleep(0.2)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_budget_cuts_running_command_as_error(self):
+        self.make_contract([{"id": "Q1", "text": "a", "check": "sleep 3", "timeout": 10},
+                            {"id": "Q2", "text": "b", "check": "test -f README.md"}])
+        self.approve()
+        started = time.monotonic()
+        ev = core.run_check(self.repo, "task-1", budget_s=0.5)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertEqual(ev["items"][0]["status"], "ERROR")
+        self.assertIn("time budget", ev["items"][0]["error"])
+        self.assertEqual(ev["items"][1]["status"], "ERROR")
+        self.assertEqual(ev["verdict"], core.VERDICT_ERROR)
+        ev2 = core.run_check(self.repo, "task-1")  # ERROR evidence is never reused
+        self.assertEqual(ev2["verdict"], core.VERDICT_PASS)
 
     def test_blocked_incomplete_paused_precedence(self):
         self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"},
@@ -232,7 +332,6 @@ class TestCheck(Base):
         self.assertEqual(core.run_check(self.repo, "task-1")["verdict"], core.VERDICT_PAUSED)
         core.set_paused(self.repo, "task-1", None)
         self.assertEqual(core.run_check(self.repo, "task-1")["verdict"], core.VERDICT_FAIL)
-        # a blocked item that actually passes counts as PASS
         (self.repo / "missing.md").write_text("x")
         core.set_mark(self.repo, "task-1", "Q2", "blocked", "stale reason")
         self.assertEqual(core.run_check(self.repo, "task-1")["verdict"], core.VERDICT_PASS)
@@ -245,6 +344,20 @@ class TestCheck(Base):
         self.assertEqual(ev["verdict"], core.VERDICT_TESTS_CHANGED)
         self.assertEqual(ev["protected_changed"], ["tests/test_a.py"])
 
+    def test_protected_rename_and_non_ascii_are_detected(self):
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}])
+        self.approve()
+        git(self.repo, "config", "diff.renames", "true")
+        (self.repo / "tests" / "test_a.py").rename(self.repo / "gone.py")
+        ev = core.run_check(self.repo, "task-1")
+        self.assertEqual(ev["verdict"], core.VERDICT_TESTS_CHANGED)
+        self.assertIn("tests/test_a.py", ev["protected_changed"])
+        (self.repo / "gone.py").rename(self.repo / "tests" / "test_a.py")
+        (self.repo / "tests" / "검사.py").write_text("x\n")
+        ev = core.run_check(self.repo, "task-1")
+        self.assertEqual(ev["verdict"], core.VERDICT_TESTS_CHANGED)
+        self.assertEqual(ev["protected_changed"], ["tests/검사.py"])
+
     def test_protected_changes_allowed(self):
         self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}], allow_protected_changes=True)
         self.approve()
@@ -253,9 +366,13 @@ class TestCheck(Base):
         self.assertEqual(ev["verdict"], core.VERDICT_PASS)
         self.assertEqual(ev["protected_changed"], ["tests/test_b.py"])
 
-    def test_repo_checks(self):
-        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}], repo_checks=["test -f nope"])
+    def test_repo_checks_never_cached(self):
+        marker = Path(self.tmp.name) / "m"
+        marker.write_text("1")
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md", "cache": True}], repo_checks=[f"test -f {marker}"])
         self.approve()
+        self.assertEqual(core.run_check(self.repo, "task-1")["verdict"], core.VERDICT_PASS)
+        marker.unlink()
         self.assertEqual(core.run_check(self.repo, "task-1")["verdict"], core.VERDICT_FAIL)
 
     def test_stale_when_check_modifies_tree(self):
@@ -264,50 +381,77 @@ class TestCheck(Base):
         ev = core.run_check(self.repo, "task-1")
         self.assertEqual(ev["verdict"], core.VERDICT_STALE)
         self.assertEqual(ev["stale_paths"], ["generated.txt"])
-        ev2 = core.run_check(self.repo, "task-1")  # file now exists before the run -> no change during the run
-        self.assertEqual(ev2["verdict"], core.VERDICT_PASS)
+        self.assertEqual(core.run_check(self.repo, "task-1")["verdict"], core.VERDICT_PASS)
 
-    def test_budget_marks_unrun_items_error(self):
-        self.make_contract([{"id": "Q1", "text": "a", "check": "sleep 1"},
-                            {"id": "Q2", "text": "b", "check": "test -f README.md"}])
+    def test_run_failure_becomes_error_and_invalidates_old_pass(self):
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}])
         self.approve()
-        ev = core.run_check(self.repo, "task-1", budget_s=0.5)
-        self.assertEqual(ev["items"][1]["status"], "ERROR")
+        self.assertEqual(core.run_check(self.repo, "task-1")["verdict"], core.VERDICT_PASS)
+        with mock.patch.object(core, "run_command", side_effect=OSError("simulated spawn failure")):
+            ev = core.run_check(self.repo, "task-1")
         self.assertEqual(ev["verdict"], core.VERDICT_ERROR)
-        ev2 = core.run_check(self.repo, "task-1")  # ERROR evidence is never reused
-        self.assertEqual(ev2["verdict"], core.VERDICT_PASS)
-        self.assertFalse(ev2["items"][0]["reused"])
+        self.assertIn("simulated spawn failure", ev["items"][0]["error"])
+        with mock.patch.object(core, "run_command", side_effect=OSError("still broken")):
+            with self.assertRaises(core.DoneContractError):
+                core.close_contract(self.repo, "task-1")
+        self.assertEqual(core.contract_state(self.repo, "task-1"), "approved")
 
-    def test_close_requires_current_evidence(self):
+    def test_interrupted_check_leaves_no_usable_evidence(self):
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}])
+        self.approve()
+        self.assertEqual(core.run_check(self.repo, "task-1")["verdict"], core.VERDICT_PASS)
+        with mock.patch.object(core, "run_command", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                core.run_check(self.repo, "task-1")
+        ev = core.load_evidence(self.repo, "task-1")
+        self.assertTrue(ev["in_progress"])
+        self.assertEqual(ev["verdict"], core.VERDICT_ERROR)
+        contract = core.load_contract(self.repo, "task-1")
+        self.assertFalse(core.evidence_is_current(self.repo, "task-1", ev, contract, core.load_marks(self.repo, "task-1"), core.working_tree_hash(self.repo)))
+
+    def test_close_reruns_checks_under_lock(self):
+        marker = Path(self.tmp.name) / "svc"
+        marker.write_text("1")
+        self.make_contract([{"id": "Q1", "text": "a", "check": f"test -f {marker}"}])
+        self.approve()
+        self.assertEqual(core.run_check(self.repo, "task-1")["verdict"], core.VERDICT_PASS)
+        marker.unlink()
+        with self.assertRaises(core.DoneContractError) as ctx:
+            core.close_contract(self.repo, "task-1")
+        self.assertIn("FAIL", str(ctx.exception))
+        self.assertEqual(core.contract_state(self.repo, "task-1"), "approved")
+        marker.write_text("1")
+        ev = core.close_contract(self.repo, "task-1")
+        self.assertEqual(ev["verdict"], core.VERDICT_PASS)
+        self.assertIsNone(core.active_task(self.repo))
+        self.assertEqual(core.load_marks(self.repo, "task-1")["closed_verdict"], core.VERDICT_PASS)
+
+    def test_close_incomplete_keeps_verdict(self):
         self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"},
                             {"id": "Q2", "text": "b", "check": "test -f missing.md"}])
         self.approve()
         with self.assertRaises(core.DoneContractError):
             core.close_contract(self.repo, "task-1")
         core.set_mark(self.repo, "task-1", "Q2", "blocked", "cannot")
-        ev = core.run_check(self.repo, "task-1")
-        self.assertEqual(ev["verdict"], core.VERDICT_INCOMPLETE)
-        core.set_mark(self.repo, "task-1", "Q2", "open", None)  # marks changed after the evidence
-        with self.assertRaises(core.DoneContractError):
-            core.close_contract(self.repo, "task-1")
-        core.set_mark(self.repo, "task-1", "Q2", "blocked", "cannot")
-        core.run_check(self.repo, "task-1")
         ev = core.close_contract(self.repo, "task-1")
         self.assertEqual(ev["verdict"], core.VERDICT_INCOMPLETE)
-        self.assertIsNone(core.active_task(self.repo))
-        self.assertEqual(core.load_marks(self.repo, "task-1")["closed_verdict"], core.VERDICT_INCOMPLETE)
         self.assertEqual(core.contract_state(self.repo, "task-1"), "closed")
+        self.assertEqual(core.load_marks(self.repo, "task-1")["closed_verdict"], core.VERDICT_INCOMPLETE)
 
-    def test_verify(self):
+    def test_verify_reports_reproduction_and_currency(self):
         self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}])
         self.approve()
         core.run_check(self.repo, "task-1")
         v = core.verify_evidence(self.repo, "task-1")
-        self.assertTrue(v["agree"] and v["hmac_valid"] and v["same_tree"])
-        (self.repo / "README.md").unlink()
+        self.assertTrue(v["ok"] and v["agree"] and v["hmac_valid"] and v["current"])
+        (self.repo / "other.txt").write_text("x")
         v2 = core.verify_evidence(self.repo, "task-1")
-        self.assertFalse(v2["agree"])
-        self.assertFalse(v2["same_tree"])
+        self.assertTrue(v2["agree"])
+        self.assertFalse(v2["current"])
+        self.assertFalse(v2["ok"])
+        (self.repo / "README.md").unlink()
+        v3 = core.verify_evidence(self.repo, "task-1")
+        self.assertFalse(v3["agree"])
 
     def test_init_needs_abandon_reason_to_replace_approved_contract(self):
         self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}])
@@ -317,9 +461,8 @@ class TestCheck(Base):
         core.init_contract(self.repo, "task-2", "another", abandon_reason="user changed direction")
         self.assertEqual(core.active_task(self.repo), "task-2")
         self.assertEqual(core.contract_state(self.repo, "task-1"), "abandoned")
-        self.assertEqual(core.load_marks(self.repo, "task-1")["abandoned"]["reason"], "user changed direction")
         with self.assertRaises(core.DoneContractError):
-            core.init_contract(self.repo, "task-1", "again")  # abandoned slugs are not reused
+            core.init_contract(self.repo, "task-1", "again")
 
 
 class TestStopHook(Base):
@@ -348,7 +491,6 @@ class TestStopHook(Base):
         self.assertEqual(out["decision"], "block")
         self.assertIn("Q1 FAIL", out["reason"])
         self.assertIn("1/3", out["reason"])
-        # stopping again without a fix is blocked again (no shortcut)
         out2 = hooks.stop(self.payload(stop_hook_active=True))
         self.assertEqual(out2["decision"], "block")
         self.assertIn("2/3", out2["reason"])
@@ -357,7 +499,7 @@ class TestStopHook(Base):
         self.assertNotIn("decision", out3)
         self.assertIn("PASS", out3["systemMessage"])
 
-    def test_block_cap_releases_without_success_receipt(self):
+    def test_block_cap_releases_without_success_receipt_and_recovers_after_fix(self):
         self.make_contract([{"id": "Q1", "text": "a", "check": "test -f missing.md"}])
         self.approve()
         for n in range(3):
@@ -370,7 +512,13 @@ class TestStopHook(Base):
         self.assertEqual(ev["released"]["reason"], "block_cap")
         self.assertEqual(ev["hmac"], core.sign_evidence(ev))
         with self.assertRaises(core.DoneContractError):
-            core.close_contract(self.repo, "task-1")  # released evidence is FAIL, so no close
+            core.close_contract(self.repo, "task-1")
+        # a real fix after the cap still yields a fresh PASS receipt
+        (self.repo / "missing.md").write_text("x")
+        out2 = hooks.stop(self.payload())
+        self.assertNotIn("decision", out2)
+        self.assertIn("PASS", out2["systemMessage"])
+        self.assertNotIn("released", core.load_evidence(self.repo, "task-1"))
 
     def test_blocked_mark_allows_stop_with_disclosure(self):
         self.make_contract([{"id": "Q1", "text": "a", "check": "test -f missing.md"}])
@@ -388,16 +536,15 @@ class TestStopHook(Base):
             hooks.stop(self.payload())
         self.assertNotIn("decision", hooks.stop(self.payload()))
         core.set_mark(self.repo, "task-1", "Q1", "blocked", "x")
-        core.run_check(self.repo, "task-1")
         core.close_contract(self.repo, "task-1")
         self.make_contract([{"id": "Q1", "text": "b", "check": "test -f missing2.md"}], task="task-2")
         self.approve(task="task-2")
         self.assertEqual(hooks.stop(self.payload())["decision"], "block")
 
     def test_error_verdict_blocks(self):
-        self.make_contract([{"id": "Q1", "text": "a", "check": "sleep 1"}, {"id": "Q2", "text": "b", "check": "test -f README.md"}])
+        self.make_contract([{"id": "Q1", "text": "a", "check": "sleep 2", "timeout": 10}, {"id": "Q2", "text": "b", "check": "test -f README.md"}])
         self.approve()
-        os.environ["DONE_CONTRACT_STOP_BUDGET"] = "0.2"
+        os.environ["DONE_CONTRACT_STOP_BUDGET"] = "0.3"
         out = hooks.stop(self.payload())
         self.assertEqual(out["decision"], "block")
         self.assertIn("ERROR", out["reason"])
@@ -416,11 +563,11 @@ class TestStopHook(Base):
 
 
 class TestPreToolHook(Base):
-    def payload(self, tool, **inp):
-        return {"session_id": "s", "cwd": str(self.repo), "hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": inp}
+    def payload(self, tool, cwd=None, **inp):
+        return {"session_id": "s", "cwd": cwd or str(self.repo), "hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": inp}
 
-    def decision(self, tool, **inp):
-        out = hooks.pretool(self.payload(tool, **inp))
+    def decision(self, tool, cwd=None, **inp):
+        out = hooks.pretool(self.payload(tool, cwd=cwd, **inp))
         return out["hookSpecificOutput"]["permissionDecision"] if out else None
 
     def test_inactive_before_approval_without_policy(self):
@@ -432,7 +579,14 @@ class TestPreToolHook(Base):
         d = lambda tool, **inp: (p(tool, **inp) or {}).get("hookSpecificOutput", {}).get("permissionDecision")
         self.assertEqual(d("Edit", file_path="src/app.py"), "deny")
         self.assertEqual(d("Bash", command="echo x > src/app.py"), "deny")
+        self.assertEqual(d("Bash", command="  rm app.py"), "deny")
+        self.assertEqual(d("Bash", command="python3 <<'EOF'\nfrom pathlib import Path\nPath('app.py').write_text('x')\nEOF"), "deny")
+        self.assertEqual(d("Bash", command="python3 -c \"open('x','w')\""), "deny")
+        self.assertEqual(d("Bash", command="node script.js"), "deny")
+        self.assertEqual(d("Bash", command="make"), "ask")
         self.assertIsNone(p("Bash", command="cat src/app.py"))
+        self.assertIsNone(p("Bash", command="git status && git diff"))
+        self.assertIsNone(p("Bash", command="pytest -q"))
         self.assertIsNone(p("Bash", command="done-contract init --task t --request 'x'"))
         self.assertEqual(d("Bash", command="done-contract approve"), "deny")
         self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}])
@@ -452,6 +606,18 @@ class TestPreToolHook(Base):
         self.assertEqual(self.decision("Edit", file_path=".done-contract/task-1/evidence.json"), "deny")
         self.assertIsNone(self.decision("Edit", file_path="src/app.py"))
         self.assertIsNone(self.decision("Edit", file_path="/etc/hosts"))
+
+    def test_paths_relative_to_cwd_symlinks_and_absolute_bash(self):
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}])
+        self.approve()
+        self.assertEqual(self.decision("Edit", cwd=str(self.repo / "tests"), file_path="fixture.txt"), "deny")
+        self.assertEqual(self.decision("Edit", cwd=str(self.repo / "tests"), file_path="../src/app.py"), None)
+        outside = Path(self.tmp.name) / "outside.py"
+        outside.write_text("x")
+        (self.repo / "tests" / "test_link.py").symlink_to(outside)
+        self.assertEqual(self.decision("Edit", file_path="tests/test_link.py"), "deny")
+        self.assertEqual(self.decision("Bash", command=f"rm {self.repo}/tests/test_a.py"), "ask")
+        self.assertEqual(self.decision("Bash", cwd=str(self.repo / "tests"), command="rm test_a.py"), "ask")
 
     def test_allowed_when_contract_permits(self):
         self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}], allow_protected_changes=True)
@@ -475,11 +641,12 @@ class TestPreToolHook(Base):
 
 
 class TestCli(Base):
-    def run_cli(self, *args, env=None, stdin=None):
+    def run_cli(self, *args, env=None, stdin=None, bin_path=None, cwd=None):
         e = dict(os.environ)
         if env:
             e.update(env)
-        return subprocess.run([sys.executable, str(BIN), "--repo", str(self.repo), *args], capture_output=True, text=True, env=e, input=stdin)
+        return subprocess.run([sys.executable, str(bin_path or BIN), "--repo", str(self.repo), *args], capture_output=True,
+                              text=True, env=e, input=stdin, cwd=cwd)
 
     def test_init_check_status_flow_and_exit_codes(self):
         r = self.run_cli("init", "--task", "feat-x", "--request", "add feature x")
@@ -499,7 +666,7 @@ class TestCli(Base):
         r = self.run_cli("mark", "Q2", "blocked", "--reason", "later")
         self.assertEqual(r.returncode, 0, r.stderr)
         r = self.run_cli("check", "--json")
-        self.assertEqual(r.returncode, 4, r.stderr)  # INCOMPLETE is not success
+        self.assertEqual(r.returncode, 4, r.stderr)
         self.assertEqual(json.loads(r.stdout)["verdict"], "INCOMPLETE")
         (self.repo / "y.txt").write_text("y")
         r = self.run_cli("check", "--json")
@@ -512,6 +679,22 @@ class TestCli(Base):
         self.assertEqual(self.run_cli("close").returncode, 0)
         self.assertIn("state: closed", self.run_cli("status", "--task", "feat-x").stdout)
 
+    def test_internal_errors_exit_5(self):
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}])
+        self.approve()
+        (core.task_dir(self.repo, "task-1") / "marks.json").write_text("{not json")
+        r = self.run_cli("check")
+        self.assertEqual(r.returncode, 5, r.stderr)
+        self.assertIn("error (internal)", r.stderr)
+
+    def test_symlinked_launcher_works_from_elsewhere(self):
+        link = Path(self.tmp.name) / "bin" / "done-contract"
+        link.parent.mkdir()
+        link.symlink_to(BIN)
+        r = self.run_cli("version", bin_path=link, cwd=self.tmp.name)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), core.VERSION)
+
     def test_hook_stop_via_cli(self):
         self.make_contract([{"id": "Q1", "text": "a", "check": "test -f missing.md"}])
         self.approve()
@@ -520,20 +703,26 @@ class TestCli(Base):
         self.assertEqual(r.returncode, 0)
         self.assertEqual(json.loads(r.stdout)["decision"], "block")
 
-    def test_hook_install_merge(self):
-        snippet = hook_snippet("/x/done-contract", require_contract=True)
-        self.assertIn("--require-contract", snippet["hooks"]["Stop"][0]["hooks"][0]["command"])
+    def test_hook_install_merge_and_upgrade(self):
+        plain = hook_snippet("/x y/done-contract")
+        self.assertIn("'/x y/done-contract' hook stop", plain["hooks"]["Stop"][0]["hooks"][0]["command"])
         settings = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other"}]}]}}
-        merged = merge_hooks(settings, snippet)
+        merged = merge_hooks(settings, plain)
         self.assertEqual(len(merged["hooks"]["Stop"]), 2)
         self.assertEqual(len(merged["hooks"]["PreToolUse"]), 1)
-        merged = merge_hooks(merged, snippet)
-        self.assertEqual(len(merged["hooks"]["Stop"]), 2)  # idempotent
-        self.assertEqual(merged["hooks"]["Stop"][1]["hooks"][0]["timeout"], 900)
+        strict = hook_snippet("/x y/done-contract", require_contract=True)
+        merged = merge_hooks(merged, strict)
+        self.assertEqual(len(merged["hooks"]["Stop"]), 2)  # replaced, not duplicated
+        self.assertEqual(merged["hooks"]["Stop"][0]["hooks"][0]["command"], "other")
+        self.assertIn("--require-contract", merged["hooks"]["Stop"][1]["hooks"][0]["command"])
+        self.assertIn("--require-contract", merged["hooks"]["PreToolUse"][0]["hooks"][0]["command"])
         r = self.run_cli("hook", "install", "--write")
         self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.run_cli("hook", "install", "--write", "--require-contract")
+        self.assertEqual(r.returncode, 0, r.stderr)
         written = json.loads((self.repo / ".claude" / "settings.json").read_text())
-        self.assertIn("hook stop", written["hooks"]["Stop"][0]["hooks"][0]["command"])
+        self.assertEqual(len(written["hooks"]["Stop"]), 1)
+        self.assertIn("--require-contract", written["hooks"]["Stop"][0]["hooks"][0]["command"])
 
 
 if __name__ == "__main__":
