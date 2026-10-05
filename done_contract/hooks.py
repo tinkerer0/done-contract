@@ -29,16 +29,28 @@ WRITE_HINT_RE = re.compile(
     r"(?<![2&<])>(?!/dev/null)|\btee\b|\bsed\s+-i\b|(^\s*|[;&|(]\s*)(sudo\s+)?(rm|rmdir|mv|cp|truncate|chmod|chown|ln|touch|install|mkdir|dd)\b"
     r"|\bgit\s+(rm|checkout|restore|mv|clean|stash|apply|am|cherry-pick|merge|rebase|reset|commit|pull)\b"
     r"|\b(python3?|perl)\s+-[ciwp]\b|\bpatch\b|\bnpm\s+(i|install|ci|update|uninstall)\b|\bpip3?\s+install\b|\bcargo\s+(add|install)\b")
-INTERPRETER_RE = re.compile(r"(^\s*|[;&|(]\s*)(sudo\s+)?(python3?|node|ruby|perl|php|sh|bash|zsh|env|nohup|xargs|eval|exec|source|\.)\b")
+INTERPRETER_RE = re.compile(r"^\s*(sudo\s+)?(python3?|node|ruby|perl|php|sh|bash|zsh|nohup|xargs|eval|exec|source|\.)\b")
 HEREDOC_RE = re.compile(r"<<-?\s*['\"]?\w+")
+# pure readers and runners that do not write by default
 READ_ONLY_RE = re.compile(
-    r"^\s*(cat|ls|ll|head|tail|less|more|wc|grep|rg|egrep|fgrep|find|fd|stat|file|which|type|pwd|echo|printf|env|printenv|date|"
-    r"whoami|id|uname|tree|du|df|diff|cmp|md5|md5sum|shasum|sha256sum|jq|yq|sort|uniq|cut|awk|sed|tr|column|basename|dirname|"
+    r"^\s*(cat|ls|ll|head|tail|less|more|wc|grep|rg|egrep|fgrep|fd|stat|file|which|type|pwd|echo|printf|printenv|date|"
+    r"whoami|id|uname|tree|du|df|diff|cmp|md5|md5sum|shasum|sha256sum|jq|yq|sort|uniq|cut|tr|column|basename|dirname|"
     r"realpath|readlink|true|false|test|\[|git\s+(status|log|diff|show|branch|rev-parse|ls-files|blame|describe|remote|tag|"
     r"stash\s+list|config\s+(--get|-l|--list))|python3?\s+-m\s+(pytest|unittest|json\.tool)|pytest|npm\s+(test|run\s+test|ls)|"
-    r"pnpm\s+test|yarn\s+test|cargo\s+(test|check|clippy)|go\s+(test|vet|build)|make\s+(test|check)|mypy|pyright|ruff|eslint|tsc)\b")
-DONE_CONTRACT_CMD_RE = re.compile(r"(^\s*|[;&|]\s*)(\S*/)?done-contract\s+(init|status|check|mark|pause|resume|verify|version|close)\b")
-SEGMENT_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;|\|)\s*")
+    r"pnpm\s+test|yarn\s+test|cargo\s+(test|check|clippy)|go\s+(test|vet)|make\s+(test|check)|mypy|pyright|ruff\s+check|"
+    r"eslint|tsc\b[^\n]*--noEmit)\b")
+# options that turn a reader/runner into a writer
+WRITE_FLAG_RE = re.compile(r"(^|\s)(--fix|--fix-only|--write|-w|--update|-u|--emit|--outDir|--out-dir|--save|--overwrite|--in-place|-i)(\s|$)")
+FIND_WRITE_RE = re.compile(r"(^|\s)-(delete|exec|execdir|ok|okdir|fprint\w*)\b")
+ENV_PREFIX_RE = re.compile(r"^\s*(env\s+)?((?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)")
+DONE_CONTRACT_CMD_RE = re.compile(r"^\s*(\S*/)?done-contract\s+(init|status|check|mark|pause|resume|verify|version|close)\b")
+SEGMENT_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;|\||\r?\n)\s*")
+
+
+def _strip_env_prefix(segment: str) -> str:
+    """`env FOO=1 cmd …` and `FOO=1 cmd …` are judged by `cmd …`."""
+    m = ENV_PREFIX_RE.match(segment)
+    return segment[m.end():] if m else segment
 
 
 def _safe_name(value: str) -> str:
@@ -156,7 +168,15 @@ def stop(payload: dict, *, require_contract: bool = False) -> dict | None:
     max_blocks = _max_blocks()
     key = f"{session}__{task}__{core.contract_sha(contract)[:16]}"
     state = _load_state(key)
-    ev = core.run_check(repo, task, reuse=True, session=session, budget_s=_budget())
+    try:
+        ev = core.run_check(repo, task, reuse=True, session=session, budget_s=_budget())
+    except core.LockBusy as exc:
+        state["blocks"] = int(state["blocks"]) + 1
+        _save_state(key, state)
+        core.log_event({"event": "stop", "repo": str(repo), "task": task, "session": session, "decision": "block", "why": "lock_busy",
+                        "blocks": state["blocks"]})
+        return {"decision": "block", "reason": f"done-contract: 검증을 수행하지 못했다 ({exc}). 다른 검사가 끝난 뒤 다시 끝내거나 "
+                                                 f"`done-contract check`를 직접 실행하라. 차단 {state['blocks']}/{max_blocks}."}
     if ev["verdict"] in core.ALLOW_STOP_VERDICTS:
         state["blocks"] = 0
         state["last_verdict"] = ev["verdict"]
@@ -208,25 +228,39 @@ def _protected_hit(lexical: str | None, resolved: str | None, protected: list[st
     return None
 
 
+def _segment_kind(segment: str) -> str:
+    """allow | deny | unknown for one shell segment, judged after env/VAR= prefixes."""
+    seg = _strip_env_prefix(segment)
+    if not seg.strip():
+        return "allow"  # bare `env` / assignment only
+    if DONE_CONTRACT_CMD_RE.match(seg) and not WRITE_HINT_RE.search(seg):
+        return "allow"
+    if WRITE_HINT_RE.search(seg):
+        return "deny"
+    if re.match(r"^\s*find\b", seg):
+        return "deny" if FIND_WRITE_RE.search(seg) else "allow"
+    if READ_ONLY_RE.match(seg):
+        return "deny" if WRITE_FLAG_RE.search(seg) else "allow"
+    if INTERPRETER_RE.match(seg):
+        return "deny"
+    return "unknown"  # sed/awk/custom scripts: a person decides
+
+
 def _bash_policy_without_contract(cmd: str) -> dict | None:
     if APPROVE_RE.search(cmd):
         return _deny("done-contract: 에이전트는 계약을 승인할 수 없다. 사람에게 `done-contract approve`를 부탁하라.")
     if HEREDOC_RE.search(cmd):
         return _deny("done-contract: 승인된 계약 없이는 heredoc 스크립트를 실행할 수 없다(require-contract).")
-    if DONE_CONTRACT_CMD_RE.search(cmd) and not WRITE_HINT_RE.search(cmd):
-        return None
     unknown = False
     for seg in SEGMENT_SPLIT_RE.split(cmd):
         if not seg.strip():
             continue
-        if WRITE_HINT_RE.search(seg):
-            return _deny("done-contract: 승인된 계약 없이는 파일을 바꾸는 명령을 실행할 수 없다(require-contract). "
+        kind = _segment_kind(seg)
+        if kind == "deny":
+            return _deny("done-contract: 승인된 계약 없이는 파일을 바꾸거나 스크립트를 실행하는 명령을 쓸 수 없다(require-contract). "
                          "`done-contract init`으로 계약 초안을 쓰고 사람에게 `done-contract approve`를 부탁하라.")
-        if READ_ONLY_RE.match(seg):
-            continue
-        if INTERPRETER_RE.match(seg):
-            return _deny("done-contract: 승인된 계약 없이는 스크립트 실행 명령을 쓸 수 없다(require-contract).")
-        unknown = True
+        if kind == "unknown":
+            unknown = True
     if unknown:
         return _ask("done-contract: 승인된 계약이 없다(require-contract). 이 명령이 파일을 바꾸지 않는지 사람이 정한다.")
     return None

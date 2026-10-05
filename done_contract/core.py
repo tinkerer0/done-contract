@@ -22,7 +22,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 CONTRACT_DIRNAME = ".done-contract"
 
 DEFAULT_PROTECTED = [
@@ -97,6 +97,10 @@ class NotInteractive(DoneContractError):
     pass
 
 
+class LockBusy(DoneContractError):
+    pass
+
+
 # ---------------------------------------------------------------- utilities
 
 def now_iso() -> str:
@@ -157,13 +161,27 @@ def log_event(event: dict) -> bool:
 
 
 @contextlib.contextmanager
-def repo_lock(repo: Path):
-    """Serialize state changes within one worktree (two sessions, one .done-contract/)."""
+def repo_lock(repo: Path, timeout: float | None = None):
+    """Serialize state changes within one worktree (two sessions, one .done-contract/).
+
+    With a timeout the wait is bounded and counts against the caller's budget;
+    an exhausted wait raises LockBusy instead of producing stale results."""
     root = contract_root(repo)
     root.mkdir(parents=True, exist_ok=True)
     ensure_excluded(repo)  # before the lock file exists, so it never enters a tree hash
     with open(root / ".lock", "a+") as fh:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        if timeout is None:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        else:
+            deadline = time.monotonic() + max(0.0, float(timeout))
+            while True:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise LockBusy("another done-contract run holds the worktree lock; the time budget ran out while waiting")
+                    time.sleep(0.05)
         try:
             yield
         finally:
@@ -263,7 +281,8 @@ def glob_to_regex(pattern: str) -> re.Pattern:
         else:
             out += re.escape(c)
         i += 1
-    return re.compile("^" + out + "$")
+    # DOTALL: a newline inside a file name is a valid path character; fullmatch below
+    return re.compile(out, re.DOTALL)
 
 
 def normalize_rel(path: str) -> str:
@@ -275,7 +294,7 @@ def normalize_rel(path: str) -> str:
 
 def matches_any(path: str, globs: list[str]) -> bool:
     norm = normalize_rel(path)
-    return any(glob_to_regex(g).match(norm) for g in globs)
+    return any(glob_to_regex(g).fullmatch(norm) for g in globs)
 
 
 def repo_relative(repo: Path, candidate: str | Path, cwd: Path | None = None) -> tuple[str | None, str | None]:
@@ -674,25 +693,27 @@ def is_closed(repo: Path, task: str) -> bool:
 
 # ---------------------------------------------------------------- running checks
 
-def _search_file(path: str, needle: bytes) -> bool:
+def _search_file(path: str, needle: bytes) -> tuple[bool, bool]:
+    """(found, truncated). truncated=True means the search stopped at MAX_OUTPUT_SEARCH_BYTES."""
     size = os.path.getsize(path)
     chunk = 8 * 1024 * 1024
     overlap = len(needle) - 1
+    limit = min(size, MAX_OUTPUT_SEARCH_BYTES)
     with open(path, "rb") as fh:
-        if size <= chunk:
-            return needle in fh.read()
+        if size <= chunk and size <= limit:
+            return (needle in fh.read(), False)
         prev = b""
         read = 0
-        while read < min(size, MAX_OUTPUT_SEARCH_BYTES):
-            buf = fh.read(chunk)
+        while read < limit:
+            buf = fh.read(min(chunk, limit - read))
             if not buf:
                 break
             read += len(buf)
             window = (prev[-overlap:] if overlap > 0 else b"") + buf
             if needle in window:
-                return True
+                return (True, False)
             prev = buf
-    return False
+    return (False, size > MAX_OUTPUT_SEARCH_BYTES)
 
 
 def _tail_of_file(path: str, tail_lines: int, tail_bytes: int) -> str:
@@ -741,30 +762,49 @@ def run_command(cmd: str, cwd: Path, timeout: float, *, expect: str | None = Non
         duration = round(time.monotonic() - started, 2)
         tail = _tail_of_file(out_path, tail_lines, tail_bytes)
         expect_matched = None
+        search_truncated = False
         if expect is not None:
-            expect_matched = _search_file(out_path, expect.encode("utf-8"))
+            expect_matched, search_truncated = _search_file(out_path, expect.encode("utf-8"))
         return {"command": cmd, "exit": exit_code, "timed_out": timed_out, "timeout_s": round(timeout, 2),
                 "duration_s": duration, "output_tail": tail, "output_bytes": os.path.getsize(out_path),
-                "output_sha256": _hash_file(out_path), "expect_matched": expect_matched}
+                "output_sha256": _hash_file(out_path), "expect_matched": expect_matched,
+                "search_truncated": search_truncated}
     finally:
         with contextlib.suppress(OSError):
             os.unlink(out_path)
 
 
+KEY_RE = re.compile(rb"^[0-9a-f]{64}$")
+
+
 def _hmac_key() -> bytes:
+    """Create-once key. The key is written completely to a private temp file and then
+    published with os.link (fails if the key exists), so no reader ever sees a partial key."""
     path = home_dir() / "key"
-    try:
-        return path.read_bytes().strip()
-    except FileNotFoundError:
-        pass
-    key = secrets.token_hex(32).encode("ascii")
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return path.read_bytes().strip()
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(key + b"\n")
-    return key
+    for _ in range(50):
+        try:
+            data = path.read_bytes().strip()
+        except FileNotFoundError:
+            data = None
+        if data is not None:
+            if KEY_RE.match(data):
+                return data
+            raise DoneContractError(f"HMAC key file is invalid: {path} (remove it to regenerate; older evidence signatures will stop verifying)")
+        key = secrets.token_hex(32).encode("ascii")
+        fd, tmp = tempfile.mkstemp(prefix=".key.", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(key + b"\n")
+            os.chmod(tmp, 0o600)
+            try:
+                os.link(tmp, path)
+                return key
+            except FileExistsError:
+                continue
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+    raise DoneContractError("could not create the HMAC key")
 
 
 def sign_evidence(evidence: dict) -> str:
@@ -823,13 +863,16 @@ def compute_verdict(item_results: list[dict], repo_results: list[dict], protecte
 
 def run_check(repo: Path, task: str, *, reuse: bool = True, session: str | None = None,
               budget_s: float | None = None) -> dict:
-    with repo_lock(repo):
-        return _run_check_locked(repo, task, reuse=reuse, session=session, budget_s=budget_s)
+    """The budget covers the whole run, including waiting for the worktree lock."""
+    deadline = None if budget_s is None else time.monotonic() + float(budget_s)
+    with repo_lock(repo, timeout=budget_s):
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        return _run_check_locked(repo, task, reuse=reuse, session=session, budget_s=remaining)
 
 
 def _blank_result(cmd: str) -> dict:
     return {"command": cmd, "exit": None, "timed_out": False, "timeout_s": None, "duration_s": 0, "output_tail": "",
-            "output_bytes": 0, "output_sha256": None, "expect_matched": None}
+            "output_bytes": 0, "output_sha256": None, "expect_matched": None, "search_truncated": False}
 
 
 def _run_check_locked(repo: Path, task: str, *, reuse: bool, session: str | None, budget_s: float | None) -> dict:
@@ -908,6 +951,8 @@ def _run_check_locked(repo: Path, task: str, *, reuse: bool, session: str | None
                 error = f"could not run: {type(exc).__name__}: {str(exc)[:200]}"
             if error is None and res["timed_out"] and cut:
                 error = f"stopped at the time budget ({timeout:.0f}s of {wanted:.0f}s); run `done-contract check` manually"
+            if error is None and res.get("search_truncated") and not res.get("expect_matched"):
+                error = f"output larger than {MAX_OUTPUT_SEARCH_BYTES // (1024 * 1024)} MiB; expect text not found in the searched part"
             passed = error is None and res["exit"] == 0 and not res["timed_out"] and (res["expect_matched"] is not False)
             reused = False
         if error:
@@ -1090,7 +1135,7 @@ def verify_evidence(repo: Path, task: str) -> dict:
         raise DoneContractError("no finished evidence to verify; run `done-contract check` first")
     contract = load_contract(repo, task)
     marks = load_marks(repo, task)
-    tree = working_tree_hash(repo)
+    tree_before = working_tree_hash(repo)
     rows = []
     agree = True
     for it in ev.get("items", []):
@@ -1110,10 +1155,14 @@ def verify_evidence(repo: Path, task: str) -> dict:
         same = rc["status"] == now
         agree = agree and same
         rows.append({"id": f"repo:{rc['command']}", "recorded": rc["status"], "now": now, "agree": same, "exit": res["exit"]})
+    # currency is judged after the commands ran: the tree, contract, marks and approval must be the same now
+    tree_after = working_tree_hash(repo)
+    stale_paths = changed_paths(repo, tree_before, tree_after) if tree_after != tree_before else []
     hmac_valid = ev.get("hmac") == sign_evidence(ev)
-    current = evidence_is_current(repo, task, ev, contract, marks, tree)
-    return {"task": task, "evidence_tree": ev.get("tree"), "current_tree": tree, "same_tree": ev.get("tree") == tree,
-            "hmac_valid": hmac_valid, "current": current, "rows": rows, "agree": agree,
+    current = (tree_after == tree_before
+               and evidence_is_current(repo, task, ev, load_contract(repo, task), load_marks(repo, task), tree_after))
+    return {"task": task, "evidence_tree": ev.get("tree"), "current_tree": tree_after, "same_tree": ev.get("tree") == tree_after,
+            "stale_paths": stale_paths, "hmac_valid": hmac_valid, "current": current, "rows": rows, "agree": agree,
             "ok": agree and hmac_valid and current}
 
 

@@ -725,5 +725,125 @@ class TestCli(Base):
         self.assertIn("--require-contract", written["hooks"]["Stop"][0]["hooks"][0]["command"])
 
 
+class TestReviewRound2(Base):
+    """Regressions for the second Codex review (N1-N6)."""
+
+    def test_bash_policy_loopholes_closed(self):
+        p = lambda cmd: hooks.pretool({"session_id": "s", "cwd": str(self.repo), "tool_name": "Bash", "tool_input": {"command": cmd}}, require_contract=True)
+        d = lambda cmd: (p(cmd) or {}).get("hookSpecificOutput", {}).get("permissionDecision")
+        self.assertEqual(d("env node edit.js"), "deny")
+        self.assertEqual(d("FOO=1 node edit.js"), "deny")
+        self.assertEqual(d("ruff check --fix app.py"), "deny")
+        self.assertEqual(d("eslint --fix src"), "deny")
+        self.assertEqual(d("tsc"), "ask")
+        self.assertIsNone(p("tsc --noEmit"))
+        self.assertEqual(d("sed 'w generated.txt' README.md"), "ask")
+        self.assertEqual(d("find . -name generated.txt -delete"), "deny")
+        self.assertIsNone(p("find . -name '*.py'"))
+        self.assertEqual(d("cat README.md\nnode edit.js"), "deny")
+        self.assertEqual(d("done-contract status && node edit.js"), "deny")
+        self.assertIsNone(p("env FOO=1 pytest -q"))
+        self.assertEqual(d("env"), "ask")  # dumps the environment (possibly secrets): a person decides
+        self.assertIsNone(p("done-contract status && cat README.md"))
+
+    def test_merge_hooks_preserves_other_hooks_in_same_group(self):
+        settings = {"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": "/x/done-contract hook stop", "timeout": 900},
+            {"type": "command", "command": "/x/other-audit-hook"},
+        ]}, {"matcher": "", "hooks": [{"type": "command", "command": "/x/done-contract hook stop"}]}]}}
+        merged = merge_hooks(settings, hook_snippet("/x/done-contract", require_contract=True))
+        stop = merged["hooks"]["Stop"]
+        commands = [h["command"] for g in stop for h in g["hooks"]]
+        self.assertIn("/x/other-audit-hook", commands)
+        self.assertEqual(sum("done-contract hook stop" in c for c in commands), 1)
+        self.assertIn("--require-contract", [c for c in commands if "done-contract" in c][0])
+        self.assertEqual(len(stop), 2)  # group that only held ours was dropped, new group added
+
+    def test_verify_detects_mutation_during_run(self):
+        trigger = Path(self.tmp.name) / "trigger"
+        self.make_contract([{"id": "Q1", "text": "a", "check": f"test -f {trigger} && echo changed > README.md; true"}])
+        self.approve()
+        self.assertEqual(core.run_check(self.repo, "task-1")["verdict"], core.VERDICT_PASS)
+        trigger.write_text("1")
+        v = core.verify_evidence(self.repo, "task-1")
+        self.assertTrue(v["agree"])
+        self.assertFalse(v["current"])
+        self.assertFalse(v["ok"])
+        self.assertEqual(v["stale_paths"], ["README.md"])
+
+    def test_newline_in_protected_path(self):
+        weird = self.repo / "tests" / "fixture\ncase.txt"
+        weird.write_text("a\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "newline name")
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}])
+        self.approve()
+        weird.write_text("b\n")
+        ev = core.run_check(self.repo, "task-1")
+        self.assertEqual(ev["verdict"], core.VERDICT_TESTS_CHANGED)
+        self.assertEqual(ev["protected_changed"], ["tests/fixture\ncase.txt"])
+        self.assertTrue(core.matches_any("tests/fixture\ncase.txt", core.DEFAULT_PROTECTED))
+        self.assertFalse(core.matches_any("tests/x.py\n", ["tests/x.py"]))
+
+    def test_lock_wait_counts_against_budget(self):
+        import threading
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}])
+        self.approve()
+        core.run_check(self.repo, "task-1")
+        held = threading.Event()
+        release = threading.Event()
+
+        def holder():
+            with core.repo_lock(self.repo):
+                held.set()
+                release.wait(5)
+
+        t = threading.Thread(target=holder)
+        t.start()
+        held.wait(5)
+        started = time.monotonic()
+        with self.assertRaises(core.LockBusy):
+            core.run_check(self.repo, "task-1", budget_s=0.3)
+        self.assertLess(time.monotonic() - started, 2)
+        os.environ["DONE_CONTRACT_STOP_BUDGET"] = "0.3"
+        out = hooks.stop({"session_id": "s", "cwd": str(self.repo), "stop_hook_active": False})
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("lock", out["reason"])
+        release.set()
+        t.join(5)
+        ev = core.load_evidence(self.repo, "task-1")
+        self.assertEqual(ev["verdict"], core.VERDICT_PASS)  # the earlier evidence was not touched
+
+    def test_hmac_key_first_use_is_atomic_and_validated(self):
+        import threading
+        results = []
+        barrier = threading.Barrier(4)
+
+        def worker():
+            barrier.wait()
+            results.append(core._hmac_key())
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(set(results)), 1)
+        self.assertEqual(len(results[0]), 64)
+        self.assertEqual(sorted(p.name for p in self.home.iterdir() if p.name.startswith(".key.")), [])
+        (self.home / "key").write_bytes(b"")
+        with self.assertRaises(core.DoneContractError):
+            core._hmac_key()
+
+    def test_expect_beyond_search_limit_is_error(self):
+        self.make_contract([{"id": "Q1", "text": "a", "check": "head -c 3000 /dev/zero | tr '\\0' 'x'; printf '\\nEXPECTED\\n'", "expect": "EXPECTED"}])
+        self.approve()
+        with mock.patch.object(core, "MAX_OUTPUT_SEARCH_BYTES", 1000):
+            ev = core.run_check(self.repo, "task-1")
+        self.assertEqual(ev["items"][0]["status"], "ERROR")
+        self.assertIn("MiB", ev["items"][0]["error"])
+        self.assertEqual(core.run_check(self.repo, "task-1")["verdict"], core.VERDICT_PASS)
+
+
 if __name__ == "__main__":
     unittest.main()

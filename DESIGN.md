@@ -112,7 +112,7 @@ v1.0은 Codex(gpt-6-astra/high) 설계 검토에서 FAIL(결함 9건), v1.1 구�
 경로 해석: 상대 경로는 payload의 `cwd` 기준으로 저장소 상대 경로를 만들고, symlink를 따라가지 않은 lexical 경로와 따라간 resolved 경로 **둘 다** 보호 경로와 대조한다. Bash 토큰의 절대 경로도 저장소 상대 경로로 바꿔 본다.
 
 - 승인된 계약이 활성일 때: `Edit`·`Write`·`MultiEdit`·`NotebookEdit`가 보호 경로(허용 안 됨)·`contract.json`·`.done-contract/` 아래를 대상으로 하면 deny. `Bash`가 `done-contract approve`·승인 디렉터리·`DONE_CONTRACT_APPROVE_NO_TTY`·`DONE_CONTRACT_HOME`을 포함하면 deny. `.done-contract/` 경로와 쓰기 힌트·heredoc이 함께 있으면 deny. 보호 경로 토큰과 쓰기 힌트가 함께 있으면 `ask`.
-- `--require-contract` 정책: 승인된 활성 계약이 없으면 Edit류는 deny(draft 계약의 `contract.json`만 허용). Bash는 3단으로 판정한다. ① approve 관련·heredoc → deny ② `done-contract init/status/...`와 쓰기 힌트 없는 읽기 전용 allowlist(cat, ls, grep, rg, find, git status/log/diff/show, pytest, npm test, cargo test …) → allow ③ 쓰기 힌트(`>`, `sed -i`, `rm`, `mv`, `git checkout` …)·인터프리터 실행(python, node, sh, bash, env …) → deny ④ 그 밖의 명령 → `ask`(사람이 정함). 셸 명령의 쓰기 여부를 완전히 판정할 수는 없으므로 Edit류는 강제, Bash는 best-effort + ask다.
+- `--require-contract` 정책: 승인된 활성 계약이 없으면 Edit류는 deny(draft 계약의 `contract.json`만 허용). Bash는 세그먼트(`&&`·`||`·`;`·`|`·줄바꿈)마다 `env`/`VAR=` 접두를 벗긴 뒤 판정한다. ① approve 관련·heredoc → deny ② 그 세그먼트가 `done-contract init/status/...`이거나 쓰기 옵션 없는 읽기 전용 allowlist(cat, ls, grep, rg, git status/log/diff/show, pytest, npm test, cargo test, ruff check, tsc --noEmit …) → allow ③ 쓰기 힌트(`>`, `sed -i`, `rm`, `mv`, `git checkout` …)·쓰기 옵션(`--fix`, `--write`, `-i` …)·`find -delete/-exec`·인터프리터 실행(python, node, sh, bash, xargs …) → deny ④ 그 밖(sed, awk, bare env, 사용자 스크립트) → `ask`(사람이 정함). 하나라도 deny면 deny, 아니면 unknown이 있으면 ask. 셸 명령의 쓰기 여부를 완전히 판정할 수는 없으므로 Edit류는 강제, Bash는 best-effort + ask다.
 - 내부 오류는 결정 없음(fail-open).
 
 ## 9. 책임표 (v1)
@@ -166,4 +166,16 @@ HMAC의 보장: 증빙 파일의 손 편집·손상을 감지한다. 키는 사�
 | 질문 3 verify 의미 | `agree`와 `current` 분리, ok는 둘 다 |
 | 질문 4 로그 실패 | 모든 systemMessage에 로그 실패 표시 |
 
-미해결: systemMessage가 대화형 화면에 보이는지(headless에서는 관측 불가). 셸 명령의 쓰기 판정은 원리적으로 불완전하다(§8).
+### v0.3 재검토 (N1~N6, v0.3.1에 반영)
+
+| 결함 | 반영 |
+|---|---|
+| N1 읽기 allowlist 우회(env 접두, `--fix`, `sed w`, `find -delete`, 줄바꿈, done-contract 복합) | 세그먼트 단위 판정(줄바꿈도 분리), `env`/`VAR=` 접두 제거 뒤 판정, `--fix`·`--write`·`-i` 등 쓰기 옵션은 deny, `find`는 `-delete`/`-exec`면 deny, `tsc`는 `--noEmit`만 allow, `sed`·`awk`·bare `env`는 ask, done-contract 예외는 그 세그먼트에만 |
+| N2 재설치가 같은 group의 타 hook 삭제 | hooks 배열의 자사 항목만 교체, matcher·타 항목 보존, 비는 group만 제거 |
+| N3 verify가 실행 중 변경을 놓침 | verify도 전후 tree 비교, `current`는 실행 후 상태로 판정, `stale_paths` 보고 |
+| N4 줄바꿈 파일명이 glob에 안 걸림 | glob regex DOTALL + fullmatch |
+| N5 lock 대기가 예산 밖 | `repo_lock(timeout)`이 LOCK_NB 폴링, 대기 포함 deadline, 초과 시 LockBusy → Stop hook은 차단(상한에 포함) |
+| N6 HMAC 키 생성 경쟁 | 임시 파일에 완전히 쓴 뒤 `os.link`로 원자 공개, 읽을 때 64 hex 검증(빈 파일은 오류) |
+| 질문 2 200 MiB 검색 한계 | 한계 초과이면서 expect 미발견이면 항목 ERROR |
+
+미해결: systemMessage가 대화형 화면에 보이는지(headless에서는 관측 불가). 셸 명령의 쓰기 판정은 원리적으로 불완전하다(§8). check 로그 실패는 CLI에는 표시하지 않는다(질문 1, 범위 밖으로 둠).

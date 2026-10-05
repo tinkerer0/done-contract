@@ -157,18 +157,30 @@ def hook_snippet(bin_path: str, require_contract: bool = False) -> dict:
     }
 
 
-def _is_ours(group: dict, kind: str) -> bool:
-    return any("done-contract" in str(h.get("command", "")) and kind in str(h.get("command", "")) for h in group.get("hooks", []))
+def _is_ours_cmd(hook: dict, kind: str) -> bool:
+    cmd = str(hook.get("command", ""))
+    return "done-contract" in cmd and kind in cmd
 
 
 def merge_hooks(settings: dict, snippet: dict) -> dict:
-    """Install or upgrade our hook groups; other tools' hooks are preserved untouched."""
+    """Install or upgrade our hook entries. Other tools' entries, even inside the same
+    group, and the group's matcher are preserved; a group is dropped only when it held
+    nothing but our entry."""
     hooks_cfg = settings.setdefault("hooks", {})
     for event, groups in snippet["hooks"].items():
         kind = "hook stop" if event == "Stop" else "hook pretool"
-        existing = [g for g in hooks_cfg.get(event, []) if not _is_ours(g, kind)]
-        existing.extend(groups)
-        hooks_cfg[event] = existing
+        kept_groups = []
+        for g in hooks_cfg.get(event, []) or []:
+            if not isinstance(g, dict):
+                kept_groups.append(g)
+                continue
+            others = [h for h in g.get("hooks", []) if not (isinstance(h, dict) and _is_ours_cmd(h, kind))]
+            if others or not g.get("hooks"):
+                g2 = dict(g)
+                g2["hooks"] = others
+                kept_groups.append(g2)
+        kept_groups.extend(groups)
+        hooks_cfg[event] = kept_groups
     return settings
 
 
