@@ -1,0 +1,28 @@
+{
+  "allow_protected_changes": false,
+  "baseline_head": "a61790a15ed5481e512f6e5478826ca86a74b25c",
+  "baseline_tree": "6cbb90f885ebe6b9928f21328b0360dac029dc34",
+  "created_at": "2026-10-05T07:44:54Z",
+  "items": [
+    {
+      "id": "Q1",
+      "text": "hello.txt 파일이 존재한다",
+      "check": "test -f hello.txt"
+    }
+  ],
+  "protected": [
+    "tests/**",
+    "test/**",
+    "**/__tests__/**",
+    "**/test_*.py",
+    "**/*_test.py",
+    "**/*_test.go",
+    "**/*.test.*",
+    "**/*.spec.*",
+    "**/conftest.py"
+  ],
+  "repo_checks": [],
+  "request": "hello.txt 파일을 만들어 달라",
+  "task": "live-1",
+  "version": 1
+}
