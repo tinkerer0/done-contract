@@ -250,9 +250,14 @@ def working_tree_hash(repo: Path, *, verify_cache: bool = False) -> str:
     try:
         env = dict(os.environ)
         env["GIT_INDEX_FILE"] = work
+        copied = False
         if cache.exists():
-            shutil.copy2(cache, work)
-        else:
+            try:
+                shutil.copy2(cache, work)
+                copied = True
+            except FileNotFoundError:
+                copied = False  # another run's generation cleanup removed it between the check and the copy: cache miss
+        if not copied:
             os.unlink(work)  # let git create a valid index file itself
             if head_sha(repo):
                 git(repo, "read-tree", "HEAD", env=env)
@@ -427,7 +432,7 @@ def glob_to_regex(pattern: str) -> re.Pattern:
                 negate = body.startswith(("!", "^"))
                 if negate:
                     body = body[1:]
-                body = body.replace("\\", "\\\\").replace("]", "\\]")
+                body = body.replace("\\", "\\\\").replace("]", "\\]").replace("[", "\\[")
                 out += "[" + ("^" if negate else "") + body + "]"
                 i = j + 1
                 continue

@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1014,9 +1015,30 @@ class TestReviewV04b(Base):
         self.assertEqual(core.working_tree_hash(self.repo, verify_cache=True), core.fresh_tree_hash(self.repo))
 
     def test_lint_rejects_patterns_that_do_not_compile(self):
+        import warnings
         self.assertIsNotNone(core.glob_problem("[!]"))
         self.assertIsNotNone(core.glob_problem("[z-a]"))
-        self.assertIsNone(core.glob_problem("[[]literal"))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # Python's "possible nested set" FutureWarning must not fire
+            self.assertIsNone(core.glob_problem("[[]literal"))
+            self.assertTrue(core.matches_any("[literal", ["[[]literal"]))
+
+    def test_cache_removed_between_check_and_copy_is_a_miss(self):
+        core.working_tree_hash(self.repo)
+        real_copy2 = shutil.copy2
+        calls = {"n": 0}
+
+        def flaky_copy2(src, dst, *a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                os.unlink(src)  # a concurrent generation cleanup wins the race
+                raise FileNotFoundError(src)
+            return real_copy2(src, dst, *a, **k)
+
+        with mock.patch.object(core.shutil, "copy2", side_effect=flaky_copy2):
+            h = core.working_tree_hash(self.repo)
+        self.assertEqual(h, core.fresh_tree_hash(self.repo))
+        self.assertEqual(len(list(core.contract_root(self.repo).glob(".index.*"))), 1)
 
     def test_same_second_reapproval_is_a_new_approval(self):
         counter = Path(self.tmp.name) / "c"
