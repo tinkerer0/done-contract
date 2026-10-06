@@ -981,6 +981,41 @@ class TestReviewV043(Base):
         (self.repo / "vendor").symlink_to(b)  # a link to another repository's top
         self.assertIsNone(self.edit(self.repo / "vendor" / "src" / "app.py"))  # not a protected path of A
 
+    def test_f1b_nested_repository_behind_a_link(self):
+        b = self.second_repo()
+        nested = b / "src" / "module"
+        nested.mkdir()
+        git(nested, "init", "-q", "-b", "main")
+        (nested / "src").mkdir()
+        (nested / "src" / "app.py").write_text("x\n")
+        (self.repo / "tests" / "link").symlink_to(b / "src")
+        self.approved()
+        os.environ["CLAUDE_PROJECT_DIR"] = str(self.repo)
+        target = self.repo / "tests" / "link" / "module" / "src" / "app.py"
+        self.assertEqual(hooks._lexical_repo(target), self.repo)
+        self.assertEqual(self.edit(target), "deny")
+        self.assertEqual(hooks._lexical_repo(self.repo / "README.md"), self.repo)  # ordinary path, ancestors may hold OS symlinks
+
+    def test_quoted_cd_path(self):
+        spaced = Path(self.tmp.name) / "space project"
+        spaced.mkdir()
+        git(spaced, "init", "-q", "-b", "main")
+        git(spaced, "config", "user.email", "t@example.com")
+        git(spaced, "config", "user.name", "t")
+        (spaced / "tests").mkdir()
+        (spaced / "tests" / "test_a.py").write_text("def test_a():\n    pass\n")
+        git(spaced, "add", "-A")
+        git(spaced, "commit", "-q", "-m", "init")
+        spaced = spaced.resolve()
+        c = core.init_contract(spaced, "t", "x")
+        c["items"] = [{"id": "Q1", "text": "a", "check": "test -d tests"}]
+        core.write_json(core.task_dir(spaced, "t") / "contract.json", c)
+        os.environ["DONE_CONTRACT_APPROVE_NO_TTY"] = "1"
+        core.approve_contract(spaced, "t", stdout=io.StringIO(), dry_run=False)
+        elsewhere = self.second_repo("elsewhere")
+        os.environ["CLAUDE_PROJECT_DIR"] = str(spaced)
+        self.assertEqual(self.bash(f"cd '{spaced}' && rm tests/test_a.py", cwd=elsewhere), "ask")
+
     def test_f2_ignored_alias_never_hides_a_tracked_test(self):
         (self.repo / ".gitignore").write_text("tests/ignored-link.py\n")
         git(self.repo, "add", "-A")

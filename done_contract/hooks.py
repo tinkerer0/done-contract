@@ -107,19 +107,22 @@ def _project_repo(payload: dict) -> Path | None:
 
 
 def _lexical_repo(path: Path) -> Path | None:
-    """Repository that owns the path as written. Walks up to the nearest directory holding
-    .git, but never trusts a .git seen through a symlinked component: a symlink entry (also a
-    dangling one) belongs to the repository that contains the link itself."""
-    a = Path(os.path.normpath(str(path)))
-    while True:
-        if not a.is_symlink() and a.is_dir() and (a / ".git").exists():
+    """Repository that owns the path as written. A symlinked component that lies inside a
+    repository makes that repository the owner (the link entry is its file), even when the link
+    leads to, or through, another repository; symlinks above every repository (e.g. macOS /var)
+    are ignored. Otherwise the owner is the nearest directory holding .git."""
+    p = Path(os.path.normpath(str(path)))
+    chain = [p] + list(p.parents)  # bottom-up
+    for i, a in enumerate(chain):
+        if a.is_symlink() and any((up / ".git").exists() for up in chain[i + 1:]):
+            return _lexical_repo(a.parent)
+    for a in chain:
+        if a.is_dir() and (a / ".git").exists():
             try:
                 return core.repo_root(a)
             except core.GitError:
                 return None
-        if a.parent == a:
-            return None
-        a = a.parent
+    return None
 
 
 def _candidate_repos(payload: dict) -> list[Path]:
@@ -370,17 +373,19 @@ def _edit_decision(repo: Path, task: str, target: Path) -> dict | None:
     return None
 
 
-CD_RE = re.compile(r"^\s*(?:cd|pushd)\s+(\S+)")
-
-
 def _command_bases(cmd: str, cwd: Path) -> list[Path]:
-    """The shell cwd plus every directory the command `cd`s into (best effort, in order)."""
+    """The shell cwd plus every directory the command `cd`s into (best effort, in order; quoted
+    paths are supported, variables and substitutions are not)."""
     bases = [cwd]
     current = cwd
     for seg in SEGMENT_SPLIT_RE.split(cmd):
-        m = CD_RE.match(_strip_env_prefix(seg))
-        if m:
-            arg = os.path.expanduser(m.group(1).strip("'\""))
+        part = _strip_env_prefix(seg)
+        try:
+            toks = shlex.split(part, posix=True)
+        except ValueError:
+            toks = part.split()
+        if len(toks) >= 2 and toks[0] in ("cd", "pushd"):
+            arg = os.path.expanduser(toks[1])
             current = Path(os.path.normpath(str(Path(arg) if os.path.isabs(arg) else current / arg)))
             bases.append(current)
     return bases
