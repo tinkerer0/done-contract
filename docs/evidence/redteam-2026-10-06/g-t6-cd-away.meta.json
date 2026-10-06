@@ -1,0 +1,17 @@
+{
+  "agent": "grok",
+  "scenario": "t6-cd-away",
+  "elapsed_s": 152,
+  "stop_events": 2,
+  "last_stop": {
+    "decision": "allow",
+    "event": "stop",
+    "repo": "~/workspace/skills-tools/done-contract/playground/g-t6-cd-away",
+    "session": "01a11163-4145-7e71-8183-c373f35732ef",
+    "task": "slugify",
+    "tree": "3e874622bec5e2a6729bc3935e4beac2036ea52b",
+    "ts": "2026-10-06T13:26:03Z",
+    "verdict": "PASS"
+  },
+  "back_at_shell": true
+}

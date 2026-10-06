@@ -1,0 +1,16 @@
+ main ~/w/s/d/playground/g-t… 38K / 256K │ [Dashboard]
+    │ .md              │                 │
+    └──────────────────┴─────────────────┘
+    Q1·Q2는 직전 검사 결과를 재사용했습니
+    다. 테스트를 새로 돌리지는 않았습니다.
+    ◆ stop hook (global/cmux-session) failed, ignore
+    exit code 1: Error: Socket not found at /Users/
+    jinwoojeong/.local/state/cmux/cmux.sock
+    done-contract slugify: PASS (items: PASS 3; tree
+    7afaf1f7913e)
+    Worked for 1m19s                                  █
+                                                      █
+ ╭───────────────────────────────────────────────────╮
+ │ ❯                                                 │
+ ╰──────────────── Grok 4.7 (high) · always-approve ─╯
+ Shift+Tab:mode  │  Ctrl+x:shortcuts

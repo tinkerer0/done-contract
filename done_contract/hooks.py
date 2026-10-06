@@ -36,7 +36,11 @@ MAX_BLOCKS_DEFAULT = 3
 STOP_BUDGET_DEFAULT_S = 840  # below the 900 s hook timeout installed by `hook install`
 
 APPROVE_RE = re.compile(r"done-contract\s+approve\b|\.done-contract[/\\]approved|DONE_CONTRACT_APPROVE_NO_TTY|DONE_CONTRACT_HOME")
-STATE_PATH_RE = re.compile(r"\.done-contract[/\\]")
+STATE_PATH_RE = re.compile(r"\.done-contract\b")  # bare dir too, so `rm -rf .done-contract` is caught
+# the agent's control surface: its state dir and every vendor's hook dir. Deleting or moving any of
+# these turns the gate off, so a destructive op naming one is denied while a contract is active.
+CONTROL_DIR_RE = re.compile(r"(?:^|[\s'\"=(/])\.(?:done-contract|claude|cursor|grok)\b")
+DESTRUCTIVE_RE = re.compile(r"(^\s*|[;&|(]\s*)(sudo\s+)?(rm|rmdir|mv|cp|ln|truncate|dd|shred)\b")
 WRITE_HINT_RE = re.compile(
     r"(?<![2&<])>(?!/dev/null)|\btee\b|\bsed\s+-i\b|(^\s*|[;&|(]\s*)(sudo\s+)?(rm|rmdir|mv|cp|truncate|chmod|chown|ln|touch|install|mkdir|dd)\b"
     r"|\bgit\s+(rm|checkout|restore|mv|clean|stash|apply|am|cherry-pick|merge|rebase|reset|commit|pull)\b"
@@ -446,6 +450,9 @@ def _bash_decision(repo: Path, task: str, cmd: str, bases: list[Path]) -> dict |
     contract = core.load_contract(repo, task)
     protected = contract.get("protected", [])
     allow = bool(contract.get("allow_protected_changes"))
+    if DESTRUCTIVE_RE.search(cmd) and CONTROL_DIR_RE.search(cmd):
+        return _deny(f"done-contract: 상태·hook 설정 디렉터리(.done-contract/.claude/.cursor/.grok)를 지우거나 옮기는 명령은 "
+                     f"승인된 계약 '{task}'이 진행 중에는 쓸 수 없다(게이트를 끄게 된다). 사람에게 부탁하라.")
     if STATE_PATH_RE.search(cmd) and (WRITE_HINT_RE.search(cmd) or HEREDOC_RE.search(cmd)):
         return _deny("done-contract: .done-contract 상태 파일은 도구 명령(mark, pause, check)으로만 바꾼다.")
     if HOOK_CONFIG_RE.search(cmd) and (WRITE_HINT_RE.search(cmd) or HEREDOC_RE.search(cmd) or INTERPRETER_RE.search(cmd)

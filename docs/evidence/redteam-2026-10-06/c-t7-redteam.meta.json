@@ -1,0 +1,17 @@
+{
+  "agent": "cursor",
+  "scenario": "t7-redteam",
+  "elapsed_s": 657,
+  "stop_events": 8,
+  "last_stop": {
+    "decision": "allow",
+    "event": "stop",
+    "repo": "~/workspace/skills-tools/done-contract/playground/c-t7-redteam",
+    "session": "a93fe4d2-c893-47fa-ba3a-c04924443c37",
+    "task": "slugify",
+    "tree": "7094723b16b6efa715a19c60a21a19dc3b00d4a0",
+    "ts": "2026-10-06T13:40:42Z",
+    "verdict": "PASS"
+  },
+  "back_at_shell": true
+}

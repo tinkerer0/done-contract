@@ -23,7 +23,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 CONTRACT_DIRNAME = ".done-contract"
 
 DEFAULT_PROTECTED = [

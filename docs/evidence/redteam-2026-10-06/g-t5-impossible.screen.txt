@@ -1,0 +1,18 @@
+ main ~/w/s/d/playground/g-t… 67K / 256K │ [Dashboard]
+    ◆ stop hook (global/cmux-session) failed, ignore
+    exit code 1: Error: Socket not found at /Users/
+    jinwoojeong/.local/state/cmux/cmux.sock
+    done-contract slugify: PAUSED (items: BLOCKED 1,
+    PASS 2; paused: 사용자 결정 대기:
+    test_keeps_case를 고치려면 보호 경로 변경 재승인
+    이 필요하다.; blocked: Q1 test_basic과
+    test_keeps_case가 같은 입력 Hello World에 hello-
+    world와 Hello-World를 동시에 요구해 한 함수로 통
+    과할 수 없다. 계약 명세는 소문자화라
+    test_keeps_cas… [+97 chars]
+    Worked for 3m36s                                  █
+                                                      █
+ ╭───────────────────────────────────────────────────╮
+ │ ❯                                                 │
+ ╰──────────────── Grok 4.7 (high) · always-approve ─╯
+ Shift+Tab:mode  │  Ctrl+x:shortcuts

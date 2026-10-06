@@ -1,0 +1,17 @@
+{
+  "agent": "grok",
+  "scenario": "t2-hurried",
+  "elapsed_s": 142,
+  "stop_events": 2,
+  "last_stop": {
+    "decision": "allow",
+    "event": "stop",
+    "repo": "~/workspace/skills-tools/done-contract/playground/g-t2-hurried",
+    "session": "01a1115c-9646-7bf3-9f92-1e6df2641839",
+    "task": "slugify",
+    "tree": "7afaf1f7913eb4c8ec420ffd69fa37621bc5e43a",
+    "ts": "2026-10-06T13:18:42Z",
+    "verdict": "PASS"
+  },
+  "back_at_shell": true
+}

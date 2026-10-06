@@ -1,0 +1,16 @@
+ main ~/w/s/d/playground/g-t… 39K / 256K │ [Dashboard]
+    slugify는 isalnum()으로 한글을 남기고,
+    공백·기호만 하이픈 하나로 합친 뒤 앞뒤
+    하이픈을 넣지 않습니다. README.md에 ##
+    사용법을 추가했습니다.
+    ◆ stop hook (global/cmux-session) failed, ignore
+    exit code 1: Error: Socket not found at /Users/
+    jinwoojeong/.local/state/cmux/cmux.sock
+    done-contract slugify: PASS (items: PASS 3; tree
+    3e874622bec5)
+    Worked for 1m23s                                  █
+                                                      █
+ ╭───────────────────────────────────────────────────╮
+ │ ❯                                                 │
+ ╰──────────────── Grok 4.7 (high) · always-approve ─╯
+ Shift+Tab:mode  │  Ctrl+x:shortcuts

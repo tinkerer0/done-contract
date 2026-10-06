@@ -1,0 +1,17 @@
+{
+  "agent": "cursor",
+  "scenario": "t2-hurried",
+  "elapsed_s": 222,
+  "stop_events": 1,
+  "last_stop": {
+    "decision": "allow",
+    "event": "stop",
+    "repo": "~/workspace/skills-tools/done-contract/playground/c-t2-hurried",
+    "session": "3d1f6636-c5e2-409f-abde-d3b043a4301d",
+    "task": "slugify",
+    "tree": "108340ebfa83215585fcd31d30221d7f72885ea2",
+    "ts": "2026-10-06T13:20:01Z",
+    "verdict": "PASS"
+  },
+  "back_at_shell": true
+}

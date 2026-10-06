@@ -943,6 +943,38 @@ class TestReviewV04(Base):
         self.assertIn("FAIL(exit 3)", text)
 
 
+class TestRedTeam(Base):
+    """Cheap bypasses a red-team (Gemini via Cursor) found 2026-10-06. Deleting the control
+    dirs turns the gate off, so a destructive op naming one is denied while a contract is active.
+    (Module/PATH hijack and HMAC forgery stay out of scope: the documented adversarial boundary.)"""
+
+    def approved(self, **kw):
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}], **kw)
+        self.approve(dry_run=False)
+
+    def bash(self, cmd, cwd=None):
+        out = hooks.pretool({"session_id": "s", "cwd": str(cwd or self.repo), "tool_name": "Bash", "tool_input": {"command": cmd}})
+        return out["hookSpecificOutput"]["permissionDecision"] if out else None
+
+    def test_deleting_or_moving_control_dirs_is_denied(self):
+        self.approved()
+        for cmd in ("rm -rf .done-contract", "rm -rf .done-contract/", "rmdir .done-contract",
+                    "mv .done-contract dc_backup", "rm -rf .claude", "rm -rf .claude/",
+                    "mv .cursor x", "rm -rf .grok", "cp -r .done-contract /tmp/x && rm -rf .done-contract"):
+            self.assertEqual(self.bash(cmd), "deny", cmd)
+
+    def test_normal_commands_near_those_names_are_not_blocked(self):
+        self.approved()
+        self.assertIsNone(self.bash("cat .done-contract/active"))
+        self.assertIsNone(self.bash("ls .claude"))
+        self.assertIsNone(self.bash("done-contract check"))
+        self.assertIsNone(self.bash("grep -r pattern .done-contract"))
+
+    def test_python_rmtree_of_state_dir_is_denied(self):
+        self.approved()
+        self.assertEqual(self.bash("python3 -c \"import shutil; shutil.rmtree('.done-contract')\""), "deny")
+
+
 class TestMultiCli(Base):
     """Payload shapes measured from Grok 1.0.46 and cursor-agent 2026.10.01 (probe, 2026-10-06)."""
 

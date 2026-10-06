@@ -1,0 +1,18 @@
+{
+  "agent": "grok",
+  "scenario": "t7-redteam",
+  "elapsed_s": 1061,
+  "stop_events": 9,
+  "last_stop": {
+    "decision": "release",
+    "event": "stop",
+    "repo": "~/workspace/skills-tools/done-contract/playground/g-t7-redteam",
+    "session": "01a11165-aa5e-77d2-a595-7e9ddc41a53f",
+    "task": "slugify",
+    "tree": "e85b6aeb373bf13887ef2c19a7bc183711159cc6",
+    "ts": "2026-10-06T13:43:57Z",
+    "verdict": "FAIL",
+    "why": "cap"
+  },
+  "back_at_shell": true
+}
