@@ -106,3 +106,11 @@ tail ~/.done-contract/log.jsonl
 ```sh
 python3 -m unittest -q tests.test_done_contract
 ```
+
+## 기여·피드백
+
+제가 이런 분야를 접한 지 얼마 안 돼서 부족한 점이 많습니다. 고칠 점이나 알려주실 내용이 있다면 issue나 PR로 남겨주시면 너무 감사하겠습니다.
+
+## 라이선스
+
+MIT — `LICENSE` 참고.
