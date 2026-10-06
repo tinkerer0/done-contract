@@ -23,7 +23,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 CONTRACT_DIRNAME = ".done-contract"
 
 DEFAULT_PROTECTED = [
@@ -219,7 +219,7 @@ def head_sha(repo: Path) -> str | None:
     return proc.stdout.strip() if proc.returncode == 0 else None
 
 
-def working_tree_hash(repo: Path) -> str:
+def working_tree_hash(repo: Path, *, verify_cache: bool = False) -> str:
     """Hash of the whole working tree: tracked and untracked files, .gitignore and
     info/exclude respected, symlinks as blobs (link text), submodules as gitlinks.
 
@@ -236,19 +236,21 @@ def working_tree_hash(repo: Path) -> str:
     # timestamp would silently disable. The cache is rebuilt from HEAD whenever HEAD
     # or any ignore rule changes, because `git add -A` never drops an entry that merely
     # became ignored.
+    # The cache file's name carries its generation (HEAD + ignore sources + format), so an
+    # index can never be paired with the wrong key. With verify_cache=True (close, verify)
+    # the result is cross-checked against a throwaway index; on any disagreement the cache
+    # is discarded and the fresh value wins, and the event is logged.
     root = contract_root(repo)
     root.mkdir(parents=True, exist_ok=True)
     ensure_excluded(repo)  # the index cache must never enter the tree it hashes
-    cache = root / ".index"
-    keyfile = root / ".index.key"
     key = _index_cache_key(repo)
-    fd, work = tempfile.mkstemp(prefix=".index.", dir=str(root))
+    cache = root / f".index.{key[:32]}"
+    fd, work = tempfile.mkstemp(prefix=".work.", dir=str(root))
     os.close(fd)
     try:
         env = dict(os.environ)
         env["GIT_INDEX_FILE"] = work
-        reuse_cache = cache.exists() and keyfile.exists() and keyfile.read_text(encoding="utf-8").strip() == key
-        if reuse_cache:
+        if cache.exists():
             shutil.copy2(cache, work)
         else:
             os.unlink(work)  # let git create a valid index file itself
@@ -256,33 +258,73 @@ def working_tree_hash(repo: Path) -> str:
                 git(repo, "read-tree", "HEAD", env=env)
             else:
                 git(repo, "read-tree", "--empty", env=env)
-        git(repo, "-c", "core.checkStat=default", "-c", "core.trustctime=true", "add", "-A", "--", ".", env=env)
+        git(repo, *GIT_STAT_OPTS, "add", "-A", "--", ".", env=env)
         tree = git(repo, "write-tree", env=env).strip()
         os.replace(work, cache)
-        keyfile.write_text(key + "\n", encoding="utf-8")
-        return tree
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(work)
         raise
+    for stale in root.glob(".index.*"):  # other generations: HEAD moved, ignore rules or format changed
+        if stale.name != cache.name:
+            with contextlib.suppress(OSError):
+                stale.unlink()
+    if verify_cache:
+        fresh = fresh_tree_hash(repo)
+        if fresh != tree:
+            log_event({"event": "index_cache_mismatch", "repo": str(repo), "cached": tree, "fresh": fresh})
+            with contextlib.suppress(OSError):
+                cache.unlink()
+            return fresh
+    return tree
+
+
+INDEX_CACHE_FORMAT = "3"  # bump whenever the way the private index is built changes
+GIT_STAT_OPTS = ("-c", "core.checkStat=default", "-c", "core.trustctime=true", "-c", "core.ignoreStat=false")
+
+
+def fresh_tree_hash(repo: Path) -> str:
+    """Reference hash with a throwaway index: every file is re-read. Slow on big trees."""
+    ensure_excluded(repo)
+    with tempfile.TemporaryDirectory() as td:
+        env = dict(os.environ)
+        env["GIT_INDEX_FILE"] = os.path.join(td, "index")
+        if head_sha(repo):
+            git(repo, "read-tree", "HEAD", env=env)
+        else:
+            git(repo, "read-tree", "--empty", env=env)
+        git(repo, *GIT_STAT_OPTS, "add", "-A", "--", ".", env=env)
+        return git(repo, "write-tree", env=env).strip()
 
 
 def _index_cache_key(repo: Path) -> str:
-    """HEAD plus every ignore source: when any of them changes the private index is rebuilt."""
+    """HEAD plus every ignore source git reads: when any of them changes the private index is rebuilt.
+
+    Sources: every .gitignore in the tree (also ones that are themselves ignored: git still
+    reads them), the repo's info/exclude, core.excludesFile resolved the way git does
+    (relative to the repo), or git's default global ignore file when it is not set."""
     h = hashlib.sha256()
+    h.update(INDEX_CACHE_FORMAT.encode("utf-8"))
     h.update((head_sha(repo) or "unborn").encode("utf-8"))
-    listing = git(repo, "ls-files", "-co", "--exclude-standard", "-z", "--", ".gitignore", ":(glob)**/.gitignore", check=False, binary=True)
-    for raw in sorted(p for p in listing.split(b"\0") if p):
+    seen: set[bytes] = set()
+    for args in (("-co", "--exclude-standard"), ("-o", "-i", "--exclude-standard")):
+        listing = git(repo, "ls-files", *args, "-z", "--", ".gitignore", ":(glob)**/.gitignore", check=False, binary=True)
+        seen.update(p for p in listing.split(b"\0") if p)
+    for raw in sorted(seen):
         h.update(b"\0" + raw)
         with contextlib.suppress(OSError):
             h.update(Path(repo, raw.decode("utf-8", "replace")).read_bytes())
-    sources = []
+    sources: list[Path] = []
     with contextlib.suppress(GitError):
         ex = git(repo, "rev-parse", "--git-path", "info/exclude").strip()
         sources.append(Path(ex) if os.path.isabs(ex) else repo / ex)
     extra = git(repo, "config", "--get", "core.excludesFile", check=False).strip()
     if extra:
-        sources.append(Path(os.path.expanduser(extra)))
+        p = Path(os.path.expanduser(extra))
+        sources.append(p if p.is_absolute() else repo / p)
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(str(Path.home()), ".config")
+        sources.append(Path(xdg) / "git" / "ignore")
     for src in sources:
         h.update(b"\0" + str(src).encode("utf-8"))
         with contextlib.suppress(OSError):
@@ -350,6 +392,10 @@ def glob_problem(pattern: str) -> str | None:
             i = j + 1
         else:
             i += 1
+    try:
+        glob_to_regex(p)
+    except re.error as exc:
+        return f"invalid pattern: {exc}"
     return None
 
 
@@ -775,6 +821,7 @@ def approve_contract(repo: Path, task: str, *, approver: str | None = None, assu
             "repo": str(repo),
             "approved_at": now_iso(),
             "approver": approver or os.environ.get("USER") or "unknown",
+            "nonce": secrets.token_hex(8),  # every approval event is distinct, even within one second
             "interactive": interactive,
             "tree_at_approval": final_tree,
             "pre_approval_changes": dirty,
@@ -1106,14 +1153,15 @@ def _blank_result(cmd: str) -> dict:
             "output_bytes": 0, "output_sha256": None, "expect_matched": None, "search_truncated": False}
 
 
-def _run_check_locked(repo: Path, task: str, *, reuse: bool, session: str | None, budget_s: float | None) -> dict:
+def _run_check_locked(repo: Path, task: str, *, reuse: bool, session: str | None, budget_s: float | None,
+                      verify_cache: bool = False) -> dict:
     started = time.monotonic()
     contract = load_contract(repo, task)
     csha = contract_sha(contract)
     approval = find_approval(repo, contract)
     marks = load_marks(repo, task)
     msha = marks_digest(marks)
-    tree_before = working_tree_hash(repo)
+    tree_before = working_tree_hash(repo, verify_cache=verify_cache)
     base = {
         "tool": "done-contract", "tool_version": VERSION, "task": task, "repo": str(repo),
         "contract_sha256": csha, "tree": tree_before, "baseline_tree": contract.get("baseline_tree"),
@@ -1230,7 +1278,7 @@ def _run_check_locked(repo: Path, task: str, *, reuse: bool, session: str | None
             error = f"stopped at the time budget ({timeout:.0f}s)"
         status = "ERROR" if error else ("PASS" if res["exit"] == 0 and not res["timed_out"] else "FAIL")
         repo_results.append({**res, "status": status, "reused": False, "error": error})
-    tree_after = working_tree_hash(repo)
+    tree_after = working_tree_hash(repo, verify_cache=verify_cache)
     stale = tree_after != tree_before
     changed = changed_paths(repo, contract["baseline_tree"], tree_before)
     protected_changed = [p for p in changed if matches_any(p, contract.get("protected", []))]
@@ -1360,7 +1408,7 @@ def close_contract(repo: Path, task: str) -> dict:
             raise DoneContractError("already closed")
         if contract_state(repo, task) != "approved":
             raise DoneContractError(f"contract is {contract_state(repo, task)}; only an approved contract can be closed")
-        ev = _run_check_locked(repo, task, reuse=False, session=None, budget_s=None)  # close never reuses
+        ev = _run_check_locked(repo, task, reuse=False, session=None, budget_s=None, verify_cache=True)  # close: no reuse, cross-checked snapshot
         if ev.get("verdict") not in ALLOW_STOP_VERDICTS:
             raise DoneContractError(f"close refused: fresh check verdict is {ev.get('verdict')} "
                                     "(needs PASS, INCOMPLETE or PAUSED); see evidence.md")
@@ -1384,7 +1432,7 @@ def verify_evidence(repo: Path, task: str) -> dict:
         raise DoneContractError("no finished evidence to verify; run `done-contract check` first")
     contract = load_contract(repo, task)
     marks = load_marks(repo, task)
-    tree_before = working_tree_hash(repo)
+    tree_before = working_tree_hash(repo, verify_cache=True)
     rows = []
     agree = True
     for it in ev.get("items", []):
@@ -1405,7 +1453,7 @@ def verify_evidence(repo: Path, task: str) -> dict:
         agree = agree and same
         rows.append({"id": f"repo:{rc['command']}", "recorded": rc["status"], "now": now, "agree": same, "exit": res["exit"]})
     # currency is judged after the commands ran: the tree, contract, marks and approval must be the same now
-    tree_after = working_tree_hash(repo)
+    tree_after = working_tree_hash(repo, verify_cache=True)
     stale_paths = changed_paths(repo, tree_before, tree_after) if tree_after != tree_before else []
     hmac_valid = ev.get("hmac") == sign_evidence(ev)
     current = (tree_after == tree_before

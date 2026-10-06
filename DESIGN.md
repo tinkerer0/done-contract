@@ -191,4 +191,17 @@ HMAC의 보장: 증빙 파일의 손 편집·손상을 감지한다. 키는 사�
 | F6 재승인 뒤 이전 승인의 결과 재사용 | 승인 기록 해시 `approval_id`를 증빙에 기록하고 현재성 판정에서 비교 |
 | L1 dry run이 실패를 안 보여줌 | 소요 시간 옆에 PASS/FAIL(exit n)/FAIL(expect mismatch)/TIMEOUT 표시 |
 
-미해결: systemMessage가 대화형 화면에 보이는지(headless에서는 관측 불가). 셸 명령의 쓰기 판정은 원리적으로 불완전하다(§8). check 로그 실패는 CLI에는 표시하지 않는다(질문 1, 범위 밖으로 둠). git 작업 트리 해시는 ignored 파일·symlink 대상·submodule 내부·저장소 밖 입력을 포함하지 않으므로 그런 입력에 의존하는 항목에는 watch를 쓰지 않는다.
+### v0.4.1 델타 재검토 (B1~B3·L2·L3, v0.4.2에 반영)
+
+| 결함 | 반영 |
+|---|---|
+| B1 `core.ignoreStat=true`면 index 항목이 assume-unchanged가 되어 변경을 안 봄 | `git add`에 `core.ignoreStat=false` 강제, 캐시 포맷 버전을 키에 넣어 기존 캐시 재구성 |
+| B2 캐시 키가 ignore 소스 셋을 놓침(ignored `.gitignore`, repo 기준 상대 `core.excludesFile`, 기본 XDG ignore) | 세 소스 모두 열거(ignored .gitignore는 `ls-files -o -i`, 상대 경로는 repo 기준, 미설정이면 `$XDG_CONFIG_HOME/git/ignore`) |
+| B3 index와 키를 따로 게시해 세대 혼합 | 캐시 파일명에 키를 넣어(`.index.<key>`) 한 파일이 곧 세대. 다른 세대 파일은 삭제 |
+| L2 lint가 컴파일 불가 패턴(`[!]`, `[z-a]`) 통과 | lint가 정규식 변환·컴파일까지 수행 |
+| L3 같은 초 동일 재승인이 같은 approval_id | 승인 기록에 nonce |
+| 자가 검사(독립 판정) | `close`·`verify`는 캐시 없는 fresh index로 다시 계산해 캐시와 대조한다. 어긋나면 로그(`index_cache_mismatch`)를 남기고 캐시를 버리고 fresh 값을 쓴다. 매 Stop에는 하지 않는다(대형 repo에서 10~20초) |
+
+측정: 캐시 키 계산(ignored .gitignore 열거 포함)은 muster(12 GB, node_modules 포함)에서 0.6초.
+
+미해결: systemMessage가 대화형 화면에 보이는지(headless에서는 관측 불가). 셸 명령의 쓰기 판정은 원리적으로 불완전하다(§8). check 로그 실패는 CLI에는 표시하지 않는다(질문 1, 범위 밖으로 둠). git 작업 트리 해시는 ignored 파일·symlink 대상·submodule 내부·저장소 밖 입력을 포함하지 않으므로 그런 입력에 의존하는 항목에는 watch를 쓰지 않는다. 영속 index와 fresh index의 동등성은 git의 stat 기반 변경 감지에 의존하며, close·verify의 자가 검사가 그 가정이 깨진 경우를 잡는 마지막 장치다.

@@ -942,6 +942,95 @@ class TestReviewV04(Base):
         self.assertIn("FAIL(exit 3)", text)
 
 
+class TestReviewV04b(Base):
+    """Regressions for the v0.4.1 delta review (B1-B3, L2, L3) and the cache self-check."""
+
+    def test_ignore_stat_setting_does_not_hide_changes(self):
+        git(self.repo, "config", "core.ignoreStat", "true")
+        target = self.repo / "input.txt"
+        target.write_text("GOOD\n")
+        h1 = core.working_tree_hash(self.repo)
+        target.write_text("FAIL DIFFERENT SIZE\n")
+        h2 = core.working_tree_hash(self.repo)
+        self.assertNotEqual(h1, h2)
+        self.assertEqual(h2, core.fresh_tree_hash(self.repo))
+
+    def test_cache_key_covers_every_ignore_source(self):
+        # 1. a .gitignore that is itself excluded still contributes rules
+        exclude = Path(core.git(self.repo, "rev-parse", "--git-path", "info/exclude").strip())
+        exclude = exclude if exclude.is_absolute() else self.repo / exclude
+        (self.repo / "generated.txt").write_text("g\n")
+        h0 = core.working_tree_hash(self.repo)
+        with open(exclude, "a") as fh:
+            fh.write(".gitignore\n")
+        (self.repo / ".gitignore").write_text("generated.txt\n")
+        h1 = core.working_tree_hash(self.repo)
+        self.assertEqual(h1, core.fresh_tree_hash(self.repo))
+        self.assertEqual(core.changed_paths(self.repo, h0, h1), ["generated.txt"])
+        # 2. core.excludesFile given relative to the repo, caller cwd elsewhere
+        (self.repo / ".gitignore").unlink()
+        git(self.repo, "config", "core.excludesFile", "local-ignore")
+        (self.repo / "other.txt").write_text("o\n")
+        h2 = core.working_tree_hash(self.repo)
+        (self.repo / "local-ignore").write_text("other.txt\n")
+        h3 = core.working_tree_hash(self.repo)
+        self.assertEqual(h3, core.fresh_tree_hash(self.repo))
+        self.assertIn("other.txt", core.changed_paths(self.repo, h2, h3))
+        # 3. git's default global ignore file when core.excludesFile is unset
+        git(self.repo, "config", "--unset", "core.excludesFile")
+        xdg = Path(self.tmp.name) / "xdg"
+        (xdg / "git").mkdir(parents=True)
+        os.environ["XDG_CONFIG_HOME"] = str(xdg)
+        (self.repo / "third.txt").write_text("t\n")
+        h4 = core.working_tree_hash(self.repo)
+        (xdg / "git" / "ignore").write_text("third.txt\n")
+        h5 = core.working_tree_hash(self.repo)
+        self.assertEqual(h5, core.fresh_tree_hash(self.repo))
+        self.assertIn("third.txt", core.changed_paths(self.repo, h4, h5))
+
+    def test_cache_file_name_is_its_generation(self):
+        root = core.contract_root(self.repo)
+        core.working_tree_hash(self.repo)
+        caches = sorted(p.name for p in root.glob(".index.*"))
+        self.assertEqual(len(caches), 1)
+        stale = root / ".index.deadbeefdeadbeefdeadbeefdeadbeef"
+        stale.write_bytes(b"garbage")  # a cache of another generation is never read and gets removed
+        h = core.working_tree_hash(self.repo)
+        self.assertEqual(h, core.fresh_tree_hash(self.repo))
+        self.assertFalse(stale.exists())
+        git(self.repo, "commit", "-q", "--allow-empty", "-m", "move HEAD")
+        core.working_tree_hash(self.repo)
+        self.assertEqual(len(list(root.glob(".index.*"))), 1)  # old generation dropped
+        self.assertNotIn(caches[0], [p.name for p in root.glob(".index.*")])
+
+    def test_cache_self_check_prefers_fresh_value(self):
+        core.working_tree_hash(self.repo)
+        with mock.patch.object(core, "fresh_tree_hash", return_value="0" * 40):
+            h = core.working_tree_hash(self.repo, verify_cache=True)
+        self.assertEqual(h, "0" * 40)
+        self.assertEqual(list(core.contract_root(self.repo).glob(".index.*")), [])
+        log = (self.home / "log.jsonl").read_text()
+        self.assertIn("index_cache_mismatch", log)
+        self.assertEqual(core.working_tree_hash(self.repo, verify_cache=True), core.fresh_tree_hash(self.repo))
+
+    def test_lint_rejects_patterns_that_do_not_compile(self):
+        self.assertIsNotNone(core.glob_problem("[!]"))
+        self.assertIsNotNone(core.glob_problem("[z-a]"))
+        self.assertIsNone(core.glob_problem("[[]literal"))
+
+    def test_same_second_reapproval_is_a_new_approval(self):
+        counter = Path(self.tmp.name) / "c"
+        self.make_contract([{"id": "Q1", "text": "a", "check": f"echo run >> {counter}; test -f README.md", "watch": ["src/**"]}])
+        a1 = self.approve(dry_run=False)
+        ev1 = core.run_check(self.repo, "task-1")
+        a2 = self.approve(dry_run=False)  # same contract, same approver, same second
+        self.assertNotEqual(a1["nonce"], a2["nonce"])
+        ev2 = core.run_check(self.repo, "task-1")
+        self.assertNotEqual(ev1["approval_id"], ev2["approval_id"])
+        self.assertFalse(ev2["items"][0]["reused"])
+        self.assertEqual(counter.read_text().count("run"), 2)
+
+
 class TestReviewRound2(Base):
     """Regressions for the second Codex review (N1-N6)."""
 
