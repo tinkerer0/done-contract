@@ -943,6 +943,54 @@ class TestReviewV04(Base):
         self.assertIn("FAIL(exit 3)", text)
 
 
+class TestMultiCli(Base):
+    """Payload shapes measured from Grok 1.0.46 and cursor-agent 2026.10.01 (probe, 2026-10-06)."""
+
+    def approved(self, **kw):
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f missing.md"}], **kw)
+        self.approve(dry_run=False)
+
+    def decide(self, payload):
+        out = hooks.pretool(payload)
+        return out["hookSpecificOutput"]["permissionDecision"] if out else None
+
+    def test_grok_payload_shapes(self):
+        self.approved()
+        base = {"sessionId": "g1", "session_id": "g1", "cwd": str(self.repo), "workspaceRoot": str(self.repo) + "/"}
+        self.assertEqual(self.decide({**base, "toolName": "write", "toolInput": {"file_path": str(self.repo / "tests" / "test_a.py"), "content": "x"}}), "deny")
+        self.assertEqual(self.decide({**base, "tool_name": "search_replace", "tool_input": {"file_path": "tests/test_a.py"}}), "deny")
+        self.assertEqual(self.decide({**base, "tool_name": "run_terminal_command", "tool_input": {"command": "rm tests/test_a.py"}}), "ask")
+        self.assertIsNone(self.decide({**base, "tool_name": "write", "tool_input": {"file_path": str(self.repo / "app.py")}}))
+        out = hooks.stop({**base, "stopHookActive": False, "reason": "end_turn"})
+        self.assertEqual(out["decision"], "block")
+        self.assertIsNone(hooks.stop({**base, "stopHookActive": False, "reason": "shutdown"}))  # session close: no check, no block count
+        state = hooks._load_state(f"g1__task-1__{core.contract_sha(core.load_contract(self.repo, 'task-1'))[:16]}")
+        self.assertEqual(state["blocks"], 1)
+
+    def test_cursor_payload_shapes(self):
+        self.approved()
+        base = {"session_id": "c1", "conversation_id": "c1", "cwd": str(self.repo), "workspace_roots": [str(self.repo)]}
+        self.assertEqual(self.decide({**base, "tool_name": "Write", "tool_input": {"file_path": str(self.repo / "tests" / "test_a.py")}}), "deny")
+        self.assertEqual(self.decide({**base, "tool_name": "Delete", "tool_input": {"path": str(self.repo / "tests" / "test_a.py")}}), "deny")
+        self.assertEqual(self.decide({**base, "tool_name": "Shell", "tool_input": {"command": "rm tests/test_a.py", "cwd": str(self.repo)}}), "ask")
+        self.assertIsNone(self.decide({**base, "tool_name": "Read", "tool_input": {"file_path": str(self.repo / "tests" / "test_a.py")}}))
+
+    def test_hook_config_is_protected_while_a_contract_is_approved(self):
+        def d(tool, **inp):
+            return self.decide({"session_id": "s", "cwd": str(self.repo), "tool_name": tool, "tool_input": inp})
+        self.assertIsNone(d("Edit", file_path=".claude/settings.json"))  # no contract yet: not our business
+        self.approved()
+        self.assertEqual(d("Edit", file_path=".claude/settings.json"), "deny")
+        self.assertEqual(d("Write", file_path=".claude/settings.local.json"), "deny")
+        self.assertEqual(d("Write", file_path=".cursor/hooks.json"), "deny")
+        self.assertEqual(d("Write", file_path=".grok/hooks/x.json"), "deny")
+        self.assertEqual(d("Bash", command="sed -i 's/hook stop//' .claude/settings.json"), "deny")
+        self.assertEqual(d("Bash", command="python3 -c \"import json; open('.claude/settings.local.json','w').write('{\\\"disableAllHooks\\\": true}')\""), "deny")
+        self.assertEqual(d("Bash", command="echo '{\"disableAllHooks\": true}' > ~/.claude/settings.json"), "deny")
+        self.assertIsNone(d("Bash", command="cat .claude/settings.json"))
+        self.assertIsNone(d("Edit", file_path="app.py"))
+
+
 class TestReviewV043(Base):
     """Regressions for the v0.4.3 review (F1-F4) and the residual cases it listed."""
 

@@ -11,7 +11,7 @@ from . import core, hooks
 
 HOOK_EVENTS = {
     "Stop": {"timeout": 900},
-    "PreToolUse": {"matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash", "timeout": 30},
+    "PreToolUse": {"matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|Shell|StrReplace|Delete|search_replace|write|run_terminal_command|delete_file", "timeout": 30},
 }
 
 

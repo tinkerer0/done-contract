@@ -21,7 +21,17 @@ from pathlib import Path
 
 from . import core
 
-EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+# Claude Code names first; Grok (write, search_replace, run_terminal_command) and Cursor
+# (Write, StrReplace, Delete, Shell) send their own tool names to the same hooks.
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit",
+              "write", "search_replace", "edit_file", "write_file", "create_file", "delete_file",
+              "StrReplace", "Delete", "EditNotebook"}
+SHELL_TOOLS = {"Bash", "run_terminal_command", "Shell", "shell", "run_shell_command"}
+PATH_KEYS = ("file_path", "notebook_path", "path", "target_file", "filePath", "file")
+# agent hook configuration: turning these off would switch the gate off
+HOOK_CONFIG_GLOBS = [".claude/settings.json", ".claude/settings.local.json", ".cursor/hooks.json", ".grok/hooks/**",
+                     ".grok/config.toml"]
+HOOK_CONFIG_RE = re.compile(r"\.claude[/\\]settings(\.local)?\.json|\.cursor[/\\]hooks\.json|\.grok[/\\](hooks[/\\]|config\.toml)|disableAllHooks")
 MAX_BLOCKS_DEFAULT = 3
 STOP_BUDGET_DEFAULT_S = 840  # below the 900 s hook timeout installed by `hook install`
 
@@ -220,7 +230,9 @@ def stop(payload: dict, *, require_contract: bool = False) -> dict | None:
     repos = _candidate_repos(payload)
     if not repos:
         return None
-    session = str(payload.get("session_id") or "unknown")
+    if str(payload.get("reason") or "") in ("shutdown", "channel_closed"):
+        return None  # Grok also fires Stop when the session closes; its decision is ignored there
+    session = str(payload.get("session_id") or payload.get("sessionId") or "unknown")
     deadline = time.monotonic() + _budget()
     results: list[dict] = []
     errors: list[str] = []
@@ -366,6 +378,10 @@ def _edit_decision(repo: Path, task: str, target: Path) -> dict | None:
         return _deny(f"done-contract: 승인된 계약 '{task}'은 변경할 수 없다. 기준을 바꾸려면 사람에게 새 revision 승인을 요청하라.")
     if (lexical or "").startswith(f"{core.CONTRACT_DIRNAME}/") or (resolved or "").startswith(f"{core.CONTRACT_DIRNAME}/"):
         return _deny("done-contract: 증빙·상태 파일은 도구 명령(mark, pause, check)으로만 바꾼다.")
+    config_hit = _protected_hit(lexical, resolved, HOOK_CONFIG_GLOBS)
+    if config_hit:
+        return _deny(f"done-contract: '{config_hit}'은 에이전트 hook 설정이다. 승인된 계약 '{task}'이 진행 중에는 바꿀 수 없다(게이트를 끄게 된다). "
+                     "설정 변경이 필요하면 사람에게 부탁하라.")
     hit = None if allow else _protected_hit(lexical, resolved, protected)
     if hit:
         return _deny(f"done-contract: '{hit}'은 계약 '{task}'의 보호 경로다. 테스트 대신 테스트 대상 코드를 고쳐라. "
@@ -432,6 +448,9 @@ def _bash_decision(repo: Path, task: str, cmd: str, bases: list[Path]) -> dict |
     allow = bool(contract.get("allow_protected_changes"))
     if STATE_PATH_RE.search(cmd) and (WRITE_HINT_RE.search(cmd) or HEREDOC_RE.search(cmd)):
         return _deny("done-contract: .done-contract 상태 파일은 도구 명령(mark, pause, check)으로만 바꾼다.")
+    if HOOK_CONFIG_RE.search(cmd) and (WRITE_HINT_RE.search(cmd) or HEREDOC_RE.search(cmd) or INTERPRETER_RE.search(cmd)
+                                       or re.search(r"\b(claude|grok)\s+(config|hooks?|plugin)\b", cmd)):
+        return _deny(f"done-contract: 에이전트 hook 설정은 승인된 계약 '{task}'이 진행 중에는 바꿀 수 없다(게이트를 끄게 된다). 설정 변경은 사람에게 부탁하라.")
     if allow or not (WRITE_HINT_RE.search(cmd) or HEREDOC_RE.search(cmd)):
         return None
     for lexical, resolved in _command_paths(repo, cmd, bases):
@@ -455,12 +474,14 @@ def pretool(payload: dict, *, require_contract: bool = False) -> dict | None:
     """Edits are judged by the repositories that own the edited file (as written and as resolved);
     shell commands by the project repository and the shell's current repository. The
     require-contract policy covers the project repository (where the hooks are installed)."""
-    tool = payload.get("tool_name")
-    inp = payload.get("tool_input") or {}
+    tool = payload.get("tool_name") or payload.get("toolName")
+    inp = payload.get("tool_input") or payload.get("toolInput") or {}
+    if not isinstance(inp, dict):
+        inp = {}
     cwd = _payload_cwd(payload)
     project = _project_repo(payload)
     if tool in EDIT_TOOLS:
-        fp = inp.get("file_path") or inp.get("notebook_path")
+        fp = next((inp.get(k) for k in PATH_KEYS if isinstance(inp.get(k), str) and inp.get(k)), None)
         if not fp:
             return None
         target = Path(fp) if Path(fp).is_absolute() else cwd / fp
@@ -485,7 +506,7 @@ def pretool(payload: dict, *, require_contract: bool = False) -> dict | None:
             return _deny("done-contract: 이 저장소는 승인된 계약 없이는 파일을 바꿀 수 없다(require-contract). "
                          "`done-contract init`으로 계약 초안을 쓰고 사람에게 `done-contract approve`를 부탁하라.")
         return None
-    if tool == "Bash":
+    if tool in SHELL_TOOLS:
         cmd = str(inp.get("command") or "")
         if APPROVE_RE.search(cmd):
             return _deny("done-contract: 에이전트는 계약을 승인하거나 done-contract 승인 상태를 만질 수 없다. 사람에게 `done-contract approve`를 부탁하라.")
