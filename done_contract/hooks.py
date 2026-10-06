@@ -459,9 +459,20 @@ def _names_control_dir(tok: str) -> bool:
 
 
 def _control_dir_decision(cmd: str) -> bool:
-    """True when a command would delete, move over, or overwrite a control directory. Token-aware:
-    per segment it strips env/assignment and `sudo`/`command`/`exec` prefixes and an absolute command
-    path, then checks the real target argument of a destructive verb (rm/mv/cp/find -delete …)."""
+    """True when a command would delete, move over, or overwrite a control directory. Token-aware
+    and cwd-aware: per segment it strips env/assignment and `sudo`/`command`/`exec` prefixes and an
+    absolute command path, follows `cd`/`pushd` so a relative target is resolved against it, then
+    checks the real target of a destructive verb (rm/mv/cp/find -delete …)."""
+    cwd = Path(".")
+
+    def target_hits(tok: str) -> bool:
+        t = tok.strip().strip("'\"")
+        if not t:
+            return False
+        if t.startswith("~") or os.path.isabs(t):
+            return _names_control_dir(t)
+        return _names_control_dir(os.path.normpath(str(cwd / t)))
+
     for seg in SEGMENT_SPLIT_RE.split(cmd):
         part = _strip_env_prefix(seg)
         try:
@@ -474,16 +485,19 @@ def _control_dir_decision(cmd: str) -> bool:
             continue
         verb = os.path.basename(toks[0])
         args = [a for a in toks[1:] if not a.startswith("-")]
+        if verb in ("cd", "pushd") and args:
+            a = os.path.expanduser(args[0])
+            cwd = Path(os.path.normpath(a if os.path.isabs(a) else str(cwd / a)))
+            continue
         if verb == "find":
-            if re.search(r"(^|\s)-(delete|exec|execdir|ok|okdir)\b", part):
-                if any(_names_control_dir(a) for a in args):
-                    return True
+            if re.search(r"(^|\s)-(delete|exec|execdir|ok|okdir)\b", part) and any(target_hits(a) for a in args):
+                return True
             continue
         if verb in DESTROY_VERBS or verb in MOVE_VERBS:
-            if any(_names_control_dir(a) for a in args):
+            if any(target_hits(a) for a in args):
                 return True
         elif verb in DEST_VERBS:
-            if args and _names_control_dir(args[-1]):  # destination only
+            if args and target_hits(args[-1]):  # destination only
                 return True
     return False
 

@@ -111,6 +111,14 @@ class LockBusy(DoneContractError):
 
 # ---------------------------------------------------------------- utilities
 
+def _counter(items) -> dict:
+    """Minimal multiset so repo_checks compare by command AND count (no collections import)."""
+    out: dict = {}
+    for x in items:
+        out[x] = out.get(x, 0) + 1
+    return out
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -1441,8 +1449,9 @@ def verify_evidence(repo: Path, task: str) -> dict:
     # the evidence must describe THIS contract's checks: a forged evidence that swapped an item's
     # command for a passing one would otherwise re-run its own forged command and "reproduce".
     contract_items = {it["id"]: (it["check"], it.get("expect")) for it in contract.get("items", []) if isinstance(it, dict)}
-    contract_repo = set(contract.get("repo_checks", []))
-    matches_contract = True
+    contract_repo = _counter(contract.get("repo_checks", []))
+    evidence_repo = _counter(rc.get("command") for rc in ev.get("repo_checks", []))
+    matches_contract = contract_repo == evidence_repo  # multiset: a swapped-in duplicate is caught
     rows = []
     agree = True
     for it in ev.get("items", []):
@@ -1459,14 +1468,12 @@ def verify_evidence(repo: Path, task: str) -> dict:
         agree = agree and same
         rows.append({"id": it["id"], "recorded": it["status"], "now": now, "agree": same, "exit": res["exit"]})
     for rc in ev.get("repo_checks", []):
-        if rc["command"] not in contract_repo:
-            matches_contract = False
         res = run_command(rc["command"], repo, rc.get("timeout_s") or REPO_CHECK_TIMEOUT)
         now = "PASS" if res["exit"] == 0 and not res["timed_out"] else "FAIL"
         same = rc["status"] == now
         agree = agree and same
         rows.append({"id": f"repo:{rc['command']}", "recorded": rc["status"], "now": now, "agree": same, "exit": res["exit"]})
-    if {it["id"] for it in ev.get("items", [])} != set(contract_items) or len(ev.get("repo_checks", [])) != len(contract_repo):
+    if {it["id"] for it in ev.get("items", [])} != set(contract_items):
         matches_contract = False  # an item was added or dropped
     # currency is judged after the commands ran: the tree, contract, marks and approval must be the same now
     tree_after = working_tree_hash(repo, verify_cache=True)

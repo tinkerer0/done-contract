@@ -965,7 +965,9 @@ class TestRedTeam(Base):
                     # F3: find -delete/-exec, absolute/prefixed verbs
                     "find .claude -delete", "find .done-contract -exec rm {} +", "/bin/rm -rf .claude",
                     "env rm -rf .claude", "command rm -rf .claude", "X=1 rm -rf .claude", "sudo rm -rf .grok",
-                    "cp evil.json .claude/settings.json", "ln -sf /dev/null .done-contract/active"):
+                    "cp evil.json .claude/settings.json", "ln -sf /dev/null .done-contract/active",
+                    # R2: cd into a control dir then act with a relative target
+                    "cd .claude && rm -f settings.json", "cd .done-contract && rm -rf slugify"):
             self.assertEqual(self.bash(cmd), "deny", cmd)
 
     def test_normal_commands_near_those_names_are_not_blocked(self):
@@ -1000,6 +1002,33 @@ class TestRedTeam(Base):
         self.assertFalse(v["ok"])
         with self.assertRaises(core.DoneContractError):
             core.close_contract(self.repo, "task-1")  # close re-runs the contract check -> FAIL
+
+    def test_forged_repo_check_duplicate_is_caught_and_real_duplicates_pass(self):
+        # R1: swapping a failing repo_check for a copy of a passing one must not reproduce.
+        c = self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}],
+                               repo_checks=["test -f README.md", "test -f missing.md"])
+        self.approve(dry_run=False)
+        core.run_check(self.repo, "task-1")  # FAIL (repo check 2 fails)
+        ev = core.load_evidence(self.repo, "task-1")
+        ev["verdict"] = "PASS"
+        ev["repo_checks"][1] = dict(ev["repo_checks"][0])  # replace the failing row with the passing one
+        for rc in ev["repo_checks"]:
+            rc["status"] = "PASS"
+        ev["hmac"] = core.sign_evidence(ev)
+        core.write_evidence(self.repo, "task-1", ev)
+        v = core.verify_evidence(self.repo, "task-1")
+        self.assertTrue(v["hmac_valid"])
+        self.assertFalse(v["matches_contract"])  # multiset differs
+        self.assertFalse(v["ok"])
+        # and a legitimately duplicated repo_checks contract verifies cleanly
+        c2 = self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}],
+                                repo_checks=["test -f README.md", "test -f README.md"], task="dup",
+                                abandon_reason="switch to dup test")
+        self.approve(task="dup", dry_run=False)
+        core.run_check(self.repo, "dup")
+        v2 = core.verify_evidence(self.repo, "dup")
+        self.assertTrue(v2["matches_contract"])
+        self.assertTrue(v2["ok"])
 
 
 class TestMultiCli(Base):
