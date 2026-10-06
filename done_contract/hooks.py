@@ -38,9 +38,12 @@ STOP_BUDGET_DEFAULT_S = 840  # below the 900 s hook timeout installed by `hook i
 APPROVE_RE = re.compile(r"done-contract\s+approve\b|\.done-contract[/\\]approved|DONE_CONTRACT_APPROVE_NO_TTY|DONE_CONTRACT_HOME")
 STATE_PATH_RE = re.compile(r"\.done-contract\b")  # bare dir too, so `rm -rf .done-contract` is caught
 # the agent's control surface: its state dir and every vendor's hook dir. Deleting or moving any of
-# these turns the gate off, so a destructive op naming one is denied while a contract is active.
-CONTROL_DIR_RE = re.compile(r"(?:^|[\s'\"=(/])\.(?:done-contract|claude|cursor|grok)\b")
-DESTRUCTIVE_RE = re.compile(r"(^\s*|[;&|(]\s*)(sudo\s+)?(rm|rmdir|mv|cp|ln|truncate|dd|shred)\b")
+# these turns the gate off (see _control_dir_decision), so such a command is denied while a contract
+# is active. Judged per shell segment, by path component, on the real target argument.
+CONTROL_DIR_NAMES = {".done-contract", ".claude", ".cursor", ".grok"}
+DESTROY_VERBS = {"rm", "rmdir", "shred", "truncate"}  # target all non-flag args
+MOVE_VERBS = {"mv", "rename"}                          # source or dest kills the dir
+DEST_VERBS = {"cp", "ln", "install", "rsync"}          # only the destination overwrites it
 WRITE_HINT_RE = re.compile(
     r"(?<![2&<])>(?!/dev/null)|\btee\b|\bsed\s+-i\b|(^\s*|[;&|(]\s*)(sudo\s+)?(rm|rmdir|mv|cp|truncate|chmod|chown|ln|touch|install|mkdir|dd)\b"
     r"|\bgit\s+(rm|checkout|restore|mv|clean|stash|apply|am|cherry-pick|merge|rebase|reset|commit|pull)\b"
@@ -446,11 +449,50 @@ def _protected_under_dir(repo: Path, rel: str, protected: list[str]) -> str | No
     return None
 
 
+def _names_control_dir(tok: str) -> bool:
+    """True when a path token is, or is inside, one of the control directories, matched on whole
+    path components so `.claude-notes.md` and `report.claude.txt` do not match."""
+    t = os.path.expanduser(tok.strip().strip("'\""))
+    if not t:
+        return False
+    return any(part in CONTROL_DIR_NAMES for part in t.replace("\\", "/").split("/"))
+
+
+def _control_dir_decision(cmd: str) -> bool:
+    """True when a command would delete, move over, or overwrite a control directory. Token-aware:
+    per segment it strips env/assignment and `sudo`/`command`/`exec` prefixes and an absolute command
+    path, then checks the real target argument of a destructive verb (rm/mv/cp/find -delete …)."""
+    for seg in SEGMENT_SPLIT_RE.split(cmd):
+        part = _strip_env_prefix(seg)
+        try:
+            toks = shlex.split(part, posix=True, comments=True)
+        except ValueError:
+            toks = part.split("#")[0].split()
+        while toks and (toks[0] in ("sudo", "command", "exec", "nohup", "time", "env") or "=" in toks[0]):
+            toks = toks[1:]
+        if not toks:
+            continue
+        verb = os.path.basename(toks[0])
+        args = [a for a in toks[1:] if not a.startswith("-")]
+        if verb == "find":
+            if re.search(r"(^|\s)-(delete|exec|execdir|ok|okdir)\b", part):
+                if any(_names_control_dir(a) for a in args):
+                    return True
+            continue
+        if verb in DESTROY_VERBS or verb in MOVE_VERBS:
+            if any(_names_control_dir(a) for a in args):
+                return True
+        elif verb in DEST_VERBS:
+            if args and _names_control_dir(args[-1]):  # destination only
+                return True
+    return False
+
+
 def _bash_decision(repo: Path, task: str, cmd: str, bases: list[Path]) -> dict | None:
     contract = core.load_contract(repo, task)
     protected = contract.get("protected", [])
     allow = bool(contract.get("allow_protected_changes"))
-    if DESTRUCTIVE_RE.search(cmd) and CONTROL_DIR_RE.search(cmd):
+    if _control_dir_decision(cmd):
         return _deny(f"done-contract: 상태·hook 설정 디렉터리(.done-contract/.claude/.cursor/.grok)를 지우거나 옮기는 명령은 "
                      f"승인된 계약 '{task}'이 진행 중에는 쓸 수 없다(게이트를 끄게 된다). 사람에게 부탁하라.")
     if STATE_PATH_RE.search(cmd) and (WRITE_HINT_RE.search(cmd) or HEREDOC_RE.search(cmd)):

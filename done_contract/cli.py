@@ -139,7 +139,7 @@ def cmd_verify(args) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         print(f"evidence tree {str(result['evidence_tree'])[:12]} current {str(result['current_tree'])[:12]} "
-              f"same_tree={result['same_tree']} hmac_valid={result['hmac_valid']} current={result['current']}")
+              f"same_tree={result['same_tree']} hmac_valid={result['hmac_valid']} matches_contract={result['matches_contract']} current={result['current']}")
         for row in result["rows"]:
             print(f"  {row['id']}: recorded {row['recorded']} now {row['now']} {'OK' if row['agree'] else 'MISMATCH'}")
         print("ok: reproduced and current" if result["ok"] else ("reproduced but NOT current" if result["agree"] and result["hmac_valid"] else "MISMATCH"))

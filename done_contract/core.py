@@ -1438,9 +1438,16 @@ def verify_evidence(repo: Path, task: str) -> dict:
     contract = load_contract(repo, task)
     marks = load_marks(repo, task)
     tree_before = working_tree_hash(repo, verify_cache=True)
+    # the evidence must describe THIS contract's checks: a forged evidence that swapped an item's
+    # command for a passing one would otherwise re-run its own forged command and "reproduce".
+    contract_items = {it["id"]: (it["check"], it.get("expect")) for it in contract.get("items", []) if isinstance(it, dict)}
+    contract_repo = set(contract.get("repo_checks", []))
+    matches_contract = True
     rows = []
     agree = True
     for it in ev.get("items", []):
+        if contract_items.get(it["id"]) != (it.get("command"), it.get("expect")):
+            matches_contract = False  # evidence command/expect differs from the approved contract
         if it["status"] == "ERROR":
             rows.append({"id": it["id"], "recorded": "ERROR", "now": "skipped", "agree": False, "exit": None})
             agree = False
@@ -1452,20 +1459,24 @@ def verify_evidence(repo: Path, task: str) -> dict:
         agree = agree and same
         rows.append({"id": it["id"], "recorded": it["status"], "now": now, "agree": same, "exit": res["exit"]})
     for rc in ev.get("repo_checks", []):
+        if rc["command"] not in contract_repo:
+            matches_contract = False
         res = run_command(rc["command"], repo, rc.get("timeout_s") or REPO_CHECK_TIMEOUT)
         now = "PASS" if res["exit"] == 0 and not res["timed_out"] else "FAIL"
         same = rc["status"] == now
         agree = agree and same
         rows.append({"id": f"repo:{rc['command']}", "recorded": rc["status"], "now": now, "agree": same, "exit": res["exit"]})
+    if {it["id"] for it in ev.get("items", [])} != set(contract_items) or len(ev.get("repo_checks", [])) != len(contract_repo):
+        matches_contract = False  # an item was added or dropped
     # currency is judged after the commands ran: the tree, contract, marks and approval must be the same now
     tree_after = working_tree_hash(repo, verify_cache=True)
     stale_paths = changed_paths(repo, tree_before, tree_after) if tree_after != tree_before else []
     hmac_valid = ev.get("hmac") == sign_evidence(ev)
-    current = (tree_after == tree_before
+    current = (tree_after == tree_before and matches_contract
                and evidence_is_current(repo, task, ev, load_contract(repo, task), load_marks(repo, task), tree_after))
     return {"task": task, "evidence_tree": ev.get("tree"), "current_tree": tree_after, "same_tree": ev.get("tree") == tree_after,
-            "stale_paths": stale_paths, "hmac_valid": hmac_valid, "current": current, "rows": rows, "agree": agree,
-            "ok": agree and hmac_valid and current}
+            "stale_paths": stale_paths, "hmac_valid": hmac_valid, "current": current, "matches_contract": matches_contract,
+            "rows": rows, "agree": agree, "ok": agree and hmac_valid and current}
 
 
 def shell_quote(path: str) -> str:

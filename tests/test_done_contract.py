@@ -959,20 +959,47 @@ class TestRedTeam(Base):
     def test_deleting_or_moving_control_dirs_is_denied(self):
         self.approved()
         for cmd in ("rm -rf .done-contract", "rm -rf .done-contract/", "rmdir .done-contract",
-                    "mv .done-contract dc_backup", "rm -rf .claude", "rm -rf .claude/",
-                    "mv .cursor x", "rm -rf .grok", "cp -r .done-contract /tmp/x && rm -rf .done-contract"):
+                    "mv .done-contract dc_backup", "mv bak .done-contract", "rm -rf .claude", "rm -rf .claude/",
+                    "mv .cursor x", "rm -rf .grok", "cp -r .done-contract /tmp/x && rm -rf .done-contract",
+                    "rm -rf x/.done-contract", "rm -rf .done-contract/slugify",
+                    # F3: find -delete/-exec, absolute/prefixed verbs
+                    "find .claude -delete", "find .done-contract -exec rm {} +", "/bin/rm -rf .claude",
+                    "env rm -rf .claude", "command rm -rf .claude", "X=1 rm -rf .claude", "sudo rm -rf .grok",
+                    "cp evil.json .claude/settings.json", "ln -sf /dev/null .done-contract/active"):
             self.assertEqual(self.bash(cmd), "deny", cmd)
 
     def test_normal_commands_near_those_names_are_not_blocked(self):
         self.approved()
-        self.assertIsNone(self.bash("cat .done-contract/active"))
-        self.assertIsNone(self.bash("ls .claude"))
-        self.assertIsNone(self.bash("done-contract check"))
-        self.assertIsNone(self.bash("grep -r pattern .done-contract"))
+        for cmd in ("cat .done-contract/active", "ls .claude", "done-contract check",
+                    "grep -r pattern .done-contract", "find . -name '*.claude'",
+                    # F2: files whose names merely contain the dir name, and reads/backups
+                    "rm .claude-notes.md", "rm docs/.grok-example.txt", "rm report.claude.txt",
+                    "cp -r .claude backup", "cp app.py backup.py # .grok",
+                    "cp app.py backup.py && ls .grok"):
+            self.assertIsNone(self.bash(cmd), cmd)
 
     def test_python_rmtree_of_state_dir_is_denied(self):
         self.approved()
         self.assertEqual(self.bash("python3 -c \"import shutil; shutil.rmtree('.done-contract')\""), "deny")
+
+    def test_forged_evidence_with_swapped_command_is_caught(self):
+        # the gate's own check is "test -f missing.md" (FAIL). Forge a PASS evidence whose command
+        # was swapped to a passing one and re-sign it. check (cache) is fooled, but verify sees the
+        # command no longer matches the contract, and close re-runs the contract's own check.
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f missing.md", "cache": True}])
+        self.approve(dry_run=False)
+        core.run_check(self.repo, "task-1")  # FAIL, writes evidence
+        ev = core.load_evidence(self.repo, "task-1")
+        ev["verdict"] = "PASS"
+        ev["items"][0].update({"status": "PASS", "command": "test -f README.md", "exit": 0, "timed_out": False})
+        ev["hmac"] = core.sign_evidence(ev)  # the key is readable by the same account
+        core.write_evidence(self.repo, "task-1", ev)
+        v = core.verify_evidence(self.repo, "task-1")
+        self.assertTrue(v["hmac_valid"])        # forgery is correctly signed
+        self.assertFalse(v["matches_contract"])  # but the command is not the contract's
+        self.assertFalse(v["ok"])
+        with self.assertRaises(core.DoneContractError):
+            core.close_contract(self.repo, "task-1")  # close re-runs the contract check -> FAIL
 
 
 class TestMultiCli(Base):
