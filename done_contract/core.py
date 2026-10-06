@@ -23,7 +23,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 CONTRACT_DIRNAME = ".done-contract"
 
 DEFAULT_PROTECTED = [
@@ -58,9 +58,16 @@ STRENGTH_RULES = [
 
 TASK_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 ITEM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
-ITEM_KEYS = {"id", "text", "check", "expect", "timeout", "cache"}
+ITEM_KEYS = {"id", "text", "check", "expect", "timeout", "cache", "watch"}
 CONTRACT_KEYS = {"version", "task", "request", "created_at", "baseline_head", "baseline_tree", "items",
-                 "repo_checks", "protected", "allow_protected_changes"}
+                 "repo_checks", "repo_watch", "protected", "allow_protected_changes"}
+
+# a test runner invoked with no target: the whole suite for one item (warning, not an error)
+BROAD_CHECK_RE = re.compile(
+    r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(pytest|python3?\s+-m\s+pytest|python3?\s+-m\s+unittest(\s+discover)?|npm\s+(run\s+)?test|"
+    r"pnpm\s+(run\s+)?test|yarn\s+test|bun\s+test|cargo\s+test|go\s+test\s+\./\.\.\.|make\s+test|swift\s+test|dotnet\s+test|"
+    r"gradlew?\s+test|mvn\s+test|rspec|phpunit)(\s+-[A-Za-z]+)*\s*$")
+SLOW_CHECK_DEFAULT_S = 30.0
 
 VERDICT_PASS = "PASS"
 VERDICT_INCOMPLETE = "INCOMPLETE"
@@ -404,6 +411,49 @@ def item_cacheable(item: dict) -> bool:
     return item.get("cache") is True
 
 
+def reuse_policy(item: dict) -> str:
+    """'watch' (re-run only when a watched path changed), 'tree' (re-run when anything
+    changed), or 'always' (re-run every time). Both reuse modes are human-approved."""
+    if isinstance(item.get("watch"), list) and item["watch"]:
+        return "watch"
+    if item_cacheable(item):
+        return "tree"
+    return "always"
+
+
+def can_reuse(policy_watch: list[str] | None, policy: str, changed_since_prev: list[str] | None) -> tuple[bool, str | None]:
+    """changed_since_prev is None when there is no compatible previous run."""
+    if changed_since_prev is None or policy == "always":
+        return False, None
+    if policy == "tree":
+        return (not changed_since_prev), ("tree unchanged" if not changed_since_prev else None)
+    hits = [p for p in changed_since_prev if matches_any(p, policy_watch or [])]
+    if hits:
+        return False, None
+    return True, "no watched path changed"
+
+
+def is_broad_check(check: str) -> bool:
+    return bool(BROAD_CHECK_RE.match(check))
+
+
+def lint_warnings(contract: dict) -> list[str]:
+    """Non-fatal advice shown at approval: cost and scope of the checks."""
+    warnings: list[str] = []
+    for it in contract.get("items", []) or []:
+        if not isinstance(it, dict):
+            continue
+        check = str(it.get("check", ""))
+        if is_broad_check(check):
+            warnings.append(f"{it.get('id')}: '{check.strip()}' runs the whole suite for one item; point it at the item's test file, "
+                            "or put the suite in repo_checks")
+        if reuse_policy(it) == "always":
+            warnings.append(f"{it.get('id')}: no watch/cache — this check runs every time the agent stops; add \"watch\": [paths it depends on] if its result depends on repository files only")
+    if contract.get("repo_checks") and not contract.get("repo_watch"):
+        warnings.append("repo_checks without repo_watch run every time the agent stops; add \"repo_watch\": [\"src/**\", \"tests/**\"] to run them only when code changed")
+    return warnings
+
+
 def lint_contract(contract: dict) -> list[str]:
     problems: list[str] = []
     unknown = sorted(set(contract) - CONTRACT_KEYS)
@@ -454,6 +504,13 @@ def lint_contract(contract: dict) -> list[str]:
             problems.append(f"{where}.expect must be a non-empty string or null")
         if "cache" in item and not isinstance(item["cache"], bool):
             problems.append(f"{where}.cache must be true or false")
+        if "watch" in item and (not isinstance(item["watch"], list) or not item["watch"]
+                                or not all(isinstance(g, str) and g.strip() for g in item["watch"])):
+            problems.append(f"{where}.watch must be a non-empty list of path globs")
+    repo_watch = contract.get("repo_watch")
+    if repo_watch is not None and (not isinstance(repo_watch, list) or not repo_watch
+                                   or not all(isinstance(g, str) and g.strip() for g in repo_watch)):
+        problems.append("repo_watch must be a non-empty list of path globs")
     repo_checks = contract.get("repo_checks", [])
     if not isinstance(repo_checks, list):
         problems.append("repo_checks must be a list of commands")
@@ -563,7 +620,7 @@ def find_approval(repo: Path, contract: dict) -> dict | None:
 
 
 def approve_contract(repo: Path, task: str, *, approver: str | None = None, assume_yes: bool = False,
-                     accept_dirty: bool = False, stdin=None, stdout=None) -> dict:
+                     accept_dirty: bool = False, dry_run: bool = True, stdin=None, stdout=None) -> dict:
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
     contract = load_contract(repo, task)
@@ -585,7 +642,17 @@ def approve_contract(repo: Path, task: str, *, approver: str | None = None, assu
             + ("..." if len(dirty) > 20 else "")
             + "\nreview those changes; approve with --accept-dirty to record them as pre-approval work")
     sha = contract_sha(contract)
-    stdout.write(render_contract_summary(contract) + "\n")
+    timings = None
+    if dry_run:
+        timings = dry_run_checks(repo, contract)
+        if working_tree_hash(repo) != shown_tree:
+            raise DoneContractError("the checks themselves changed the working tree during the dry run; "
+                                    "add their outputs to .gitignore or fix the checks, then run approve again")
+    try:
+        slow_s = float(os.environ.get("DONE_CONTRACT_SLOW_S", SLOW_CHECK_DEFAULT_S))
+    except ValueError:
+        slow_s = SLOW_CHECK_DEFAULT_S
+    stdout.write(render_contract_summary(contract, timings, slow_s) + "\n")
     if dirty:
         stdout.write(f"WARNING: {len(dirty)} path(s) changed before approval (recorded): {', '.join(dirty[:10])}\n")
     stdout.write(f"contract sha256: {sha}\n")
@@ -615,7 +682,9 @@ def approve_contract(repo: Path, task: str, *, approver: str | None = None, assu
             "interactive": interactive,
             "tree_at_approval": final_tree,
             "pre_approval_changes": dirty,
-            "items": [{"id": it["id"], "strength": strength_of(it["check"]), "cacheable": item_cacheable(it)} for it in contract["items"]],
+            "items": [{"id": it["id"], "strength": strength_of(it["check"]), "reuse_policy": reuse_policy(it),
+                       "dry_run_s": (timings or {}).get(it["id"], {}).get("duration_s")} for it in contract["items"]],
+            "warnings": lint_warnings(contract),
             "contract": contract,
         }
         write_json(approval_path(sha), record, mode=0o600)
@@ -624,19 +693,36 @@ def approve_contract(repo: Path, task: str, *, approver: str | None = None, assu
     return record
 
 
-def render_contract_summary(contract: dict) -> str:
+def render_contract_summary(contract: dict, timings: dict | None = None, slow_s: float = SLOW_CHECK_DEFAULT_S) -> str:
     lines = [f"task: {contract.get('task')}",
              "request: " + str(contract.get("request", "")).strip().replace("\n", " ")[:400]]
     lines.append("items:")
     for it in contract.get("items", []):
         check = str(it.get("check", ""))
-        cache = "CACHED when tree unchanged (opt-in)" if item_cacheable(it) else "re-run every time"
+        policy = reuse_policy(it)
+        if policy == "watch":
+            when = "re-run when these change: " + ", ".join(it["watch"])
+        elif policy == "tree":
+            when = "re-run when anything in the tree changes"
+        else:
+            when = "re-run EVERY time the agent stops"
+        timing = ""
+        if timings and it.get("id") in timings:
+            t = timings[it["id"]]
+            timing = f" — {t['duration_s']}s" + (" SLOW" if t["duration_s"] >= slow_s else "") + (" (timed out)" if t.get("timed_out") else "")
         lines.append(f"  {it.get('id')}: {it.get('text')}")
-        lines.append(f"      check [{strength_of(check)}, {cache}]: {check}")
+        lines.append(f"      check [{strength_of(check)}]: {check}")
+        lines.append(f"      {when}{timing}")
         if it.get("expect"):
             lines.append(f"      expect: {it['expect']}")
     if contract.get("repo_checks"):
-        lines.append("repo_checks (re-run every time): " + "; ".join(contract["repo_checks"]))
+        when = ("re-run when these change: " + ", ".join(contract["repo_watch"])) if contract.get("repo_watch") else "re-run EVERY time the agent stops"
+        lines.append("repo_checks (" + when + "): " + "; ".join(contract["repo_checks"]))
+        if timings:
+            for cmd in contract["repo_checks"]:
+                t = timings.get("repo:" + cmd)
+                if t:
+                    lines.append(f"      {cmd}: {t['duration_s']}s" + (" SLOW" if t["duration_s"] >= slow_s else ""))
     lines.append(f"protected: {', '.join(contract.get('protected', [])) or '(none)'}")
     if contract.get("allow_protected_changes"):
         lines.append("allow_protected_changes: true — the agent may add, change AND delete files under protected paths")
@@ -645,7 +731,24 @@ def render_contract_summary(contract: dict) -> str:
     weak = [it["id"] for it in contract.get("items", []) if strength_of(str(it.get("check", ""))) in ("existence", "other")]
     if weak:
         lines.append(f"note: items with weak checks (existence/other): {', '.join(weak)}")
+    for w in lint_warnings(contract):
+        lines.append(f"warning: {w}")
+    if timings:
+        total = round(sum(t["duration_s"] for k, t in timings.items()), 1)
+        lines.append(f"dry run: all checks together took {total}s; items without watch/cache repeat that cost at every stop")
     return "\n".join(lines)
+
+
+def dry_run_checks(repo: Path, contract: dict) -> dict:
+    """Run every check once (no evidence is written) to show the person what approval costs."""
+    timings: dict[str, dict] = {}
+    for it in contract.get("items", []):
+        res = run_command(it["check"], repo, float(it.get("timeout", DEFAULT_ITEM_TIMEOUT)), expect=it.get("expect"))
+        timings[it["id"]] = {"duration_s": res["duration_s"], "exit": res["exit"], "timed_out": res["timed_out"]}
+    for cmd in contract.get("repo_checks", []):
+        res = run_command(cmd, repo, float(REPO_CHECK_TIMEOUT))
+        timings["repo:" + cmd] = {"duration_s": res["duration_s"], "exit": res["exit"], "timed_out": res["timed_out"]}
+    return timings
 
 
 # ---------------------------------------------------------------- marks
@@ -917,8 +1020,12 @@ def _run_check_locked(repo: Path, task: str, *, reuse: bool, session: str | None
     if lint_problems:
         raise DoneContractError("approved contract fails lint (file changed?): " + "; ".join(lint_problems))
     prev = load_evidence(repo, task) if reuse else None
-    prev_ok = evidence_is_current(repo, task, prev, contract, marks, tree_before)
-    prev_items = {it["id"]: it for it in (prev or {}).get("items", [])} if prev_ok else {}
+    # a previous run is reusable per item when it belongs to this contract, approval and marks
+    # and finished normally; which items may skip depends on their watch/cache policy
+    prev_compatible = bool(prev) and evidence_is_current(repo, task, prev, contract, marks, prev.get("tree") or "")
+    changed_since_prev = changed_paths(repo, prev["tree"], tree_before) if prev_compatible else None
+    prev_items = {it["id"]: it for it in (prev or {}).get("items", [])} if prev_compatible else {}
+    prev_repo = {rc["command"]: rc for rc in (prev or {}).get("repo_checks", [])} if prev_compatible else {}
 
     # Invalidate older evidence first: if this run dies, nobody can close on a stale PASS.
     stub = {**base, "verdict": VERDICT_ERROR, "in_progress": True, "checked_at": now_iso(), "items": [], "repo_checks": [],
@@ -948,12 +1055,16 @@ def _run_check_locked(repo: Path, task: str, *, reuse: bool, session: str | None
         mark = marks["items"].get(it["id"])
         cached = prev_items.get(it["id"])
         base_row = {"id": it["id"], "text": it["text"], "strength": strength_of(it["check"]),
-                    "expect": it.get("expect"), "blocked_reason": None}
-        if cached and item_cacheable(it) and cached.get("status") in ("PASS", "FAIL", "BLOCKED") and cached.get("command") == it["check"]:
+                    "expect": it.get("expect"), "blocked_reason": None, "reuse_policy": reuse_policy(it), "reuse_reason": None}
+        ok_prev = bool(cached) and cached.get("status") in ("PASS", "FAIL", "BLOCKED") and cached.get("command") == it["check"] \
+            and cached.get("expect") == it.get("expect")
+        reusable, why = can_reuse(it.get("watch"), reuse_policy(it), changed_since_prev) if ok_prev else (False, None)
+        if reusable:
             res = {k: cached.get(k) for k in _blank_result(it["check"])}
             passed = cached["status"] == "PASS"
             reused = True
             error = None
+            base_row["reuse_reason"] = why
         else:
             rem = remaining()
             if rem is not None and rem <= 0:
@@ -985,7 +1096,15 @@ def _run_check_locked(repo: Path, task: str, *, reuse: bool, session: str | None
         item_results.append({**base_row, **res, "status": status, "reused": reused, "error": error,
                              "blocked_reason": (mark or {}).get("reason") if status == "BLOCKED" else None})
     repo_results = []
+    repo_watch = contract.get("repo_watch")
     for cmd in contract.get("repo_checks", []):
+        cached = prev_repo.get(cmd)
+        if cached and cached.get("status") in ("PASS", "FAIL") and repo_watch:
+            reusable, why = can_reuse(repo_watch, "watch", changed_since_prev)
+            if reusable:
+                repo_results.append({**{k: cached.get(k) for k in _blank_result(cmd)}, "status": cached["status"], "reused": True,
+                                     "error": None, "reuse_reason": why})
+                continue
         rem = remaining()
         if rem is not None and rem <= 0:
             repo_results.append({**_blank_result(cmd), "status": "ERROR", "reused": False, "error": "not run: time budget exhausted"})
@@ -1024,7 +1143,8 @@ def _run_check_locked(repo: Path, task: str, *, reuse: bool, session: str | None
         "protected_changed": protected_changed,
         "allow_protected_changes": bool(contract.get("allow_protected_changes")),
         "paused": marks.get("paused"),
-        "reused": bool(item_results) and all(r.get("reused") for r in item_results) and not repo_results,
+        "reused": bool(item_results) and all(r.get("reused") for r in item_results + repo_results),
+        "changed_since_previous_run": changed_since_prev,
     }
     evidence["hmac"] = sign_evidence(evidence)
     try:
@@ -1082,7 +1202,7 @@ def render_evidence_md(ev: dict) -> str:
         lines.append("|---|---|---|---|---|---|")
         for it in ev["items"]:
             exit_s = "timeout" if it.get("timed_out") else ("not run" if it["status"] == "ERROR" and it.get("exit") is None else str(it.get("exit")))
-            flag = " (cached)" if it.get("reused") else ""
+            flag = f" (reused: {it.get('reuse_reason') or 'cached'})" if it.get("reused") else ""
             lines.append(f"| {it['id']} {it['text']} | {it['status']}{flag} | {it['strength']} | {exit_s} | {it.get('duration_s')}s | `{it['command']}` |")
         for it in ev["items"]:
             if it["status"] == "BLOCKED":

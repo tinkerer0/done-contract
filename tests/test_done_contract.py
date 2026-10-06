@@ -279,7 +279,7 @@ class TestCheck(Base):
         counter = Path(self.tmp.name) / "runs"
         self.make_contract([{"id": "Q1", "text": "a", "check": f"echo run >> {counter}; printf 'EXPECTED\\n'; seq 1 500", "expect": "EXPECTED"},
                             {"id": "Q2", "text": "b", "check": "cat README.md", "expect": "nope"}])
-        self.approve()
+        self.approve(dry_run=False)  # the approval dry run would count as a run
         ev = core.run_check(self.repo, "task-1")
         self.assertEqual([i["status"] for i in ev["items"]], ["PASS", "FAIL"])
         self.assertTrue(ev["items"][0]["expect_matched"])
@@ -377,7 +377,10 @@ class TestCheck(Base):
 
     def test_stale_when_check_modifies_tree(self):
         self.make_contract([{"id": "Q1", "text": "a", "check": "touch generated.txt"}])
-        self.approve()
+        with self.assertRaises(core.DoneContractError):
+            self.approve()  # the dry run notices that the check writes into the tree
+        (self.repo / "generated.txt").unlink()  # the dry run's side effect
+        self.approve(dry_run=False)
         ev = core.run_check(self.repo, "task-1")
         self.assertEqual(ev["verdict"], core.VERDICT_STALE)
         self.assertEqual(ev["stale_paths"], ["generated.txt"])
@@ -723,6 +726,102 @@ class TestCli(Base):
         written = json.loads((self.repo / ".claude" / "settings.json").read_text())
         self.assertEqual(len(written["hooks"]["Stop"]), 1)
         self.assertIn("--require-contract", written["hooks"]["Stop"][0]["hooks"][0]["command"])
+
+
+class TestScopedReuse(Base):
+    """Small change: only the items that depend on it run. Big change: everything runs."""
+
+    def counter_check(self, name, extra="test -f README.md"):
+        path = Path(self.tmp.name) / name
+        return path, f"echo run >> {path}; {extra}"
+
+    def runs(self, path):
+        return path.read_text().count("run") if path.exists() else 0
+
+    def test_watch_reruns_only_when_watched_paths_change(self):
+        c1, cmd1 = self.counter_check("q1")
+        c2, cmd2 = self.counter_check("q2")
+        self.make_contract([{"id": "Q1", "text": "auth", "check": cmd1, "watch": ["src/auth/**", "tests/test_auth.py"]},
+                            {"id": "Q2", "text": "docs", "check": cmd2}])
+        self.approve(dry_run=False)
+        ev = core.run_check(self.repo, "task-1")
+        self.assertEqual((self.runs(c1), self.runs(c2)), (1, 1))
+        (self.repo / "README.md").write_text("docs only\n")  # outside Q1's watch
+        ev = core.run_check(self.repo, "task-1")
+        self.assertEqual((self.runs(c1), self.runs(c2)), (1, 2))
+        self.assertTrue(ev["items"][0]["reused"])
+        self.assertEqual(ev["items"][0]["reuse_reason"], "no watched path changed")
+        self.assertFalse(ev["items"][1]["reused"])
+        self.assertEqual(ev["changed_since_previous_run"], ["README.md"])
+        (self.repo / "src" / "auth").mkdir(parents=True)
+        (self.repo / "src" / "auth" / "limit.py").write_text("x\n")
+        ev = core.run_check(self.repo, "task-1")
+        self.assertEqual((self.runs(c1), self.runs(c2)), (2, 3))
+        self.assertFalse(ev["items"][0]["reused"])
+        self.assertEqual(ev["verdict"], core.VERDICT_PASS)
+
+    def test_watch_does_not_reuse_across_marks_or_contract_changes(self):
+        c1, cmd1 = self.counter_check("q1", extra="test -f missing.md")
+        self.make_contract([{"id": "Q1", "text": "a", "check": cmd1, "watch": ["src/**"]}])
+        self.approve(dry_run=False)
+        core.run_check(self.repo, "task-1")
+        self.assertEqual(self.runs(c1), 1)
+        core.set_mark(self.repo, "task-1", "Q1", "blocked", "later")
+        ev = core.run_check(self.repo, "task-1")  # marks changed: the previous run is not reused
+        self.assertEqual(self.runs(c1), 2)
+        self.assertEqual(ev["verdict"], core.VERDICT_INCOMPLETE)
+
+    def test_repo_watch_scopes_repo_checks(self):
+        cr, cmdr = self.counter_check("repo_counter")
+        c = self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md", "watch": ["src/**"]}], repo_checks=[cmdr])
+        c["repo_watch"] = ["src/**", "tests/**"]
+        core.write_json(core.task_dir(self.repo, "task-1") / "contract.json", c)
+        self.approve(dry_run=False)
+        core.run_check(self.repo, "task-1")
+        self.assertEqual(self.runs(cr), 1)
+        (self.repo / "docs.md").write_text("d\n")
+        ev = core.run_check(self.repo, "task-1")
+        self.assertEqual(self.runs(cr), 1)
+        self.assertTrue(ev["repo_checks"][0]["reused"])
+        self.assertTrue(ev["reused"])
+        (self.repo / "tests" / "test_a.py").write_text("def test_a():\n    pass\n")  # protected AND watched
+        ev = core.run_check(self.repo, "task-1")
+        self.assertEqual(self.runs(cr), 2)
+        self.assertEqual(ev["verdict"], core.VERDICT_TESTS_CHANGED)
+
+    def test_broad_check_detection_and_warnings(self):
+        self.assertTrue(core.is_broad_check("pytest -q"))
+        self.assertTrue(core.is_broad_check("npm test"))
+        self.assertTrue(core.is_broad_check("CI=1 cargo test"))
+        self.assertFalse(core.is_broad_check("pytest tests/test_login.py -q"))
+        self.assertFalse(core.is_broad_check("cargo test --lib physics"))
+        self.assertFalse(core.is_broad_check("grep -q x README.md"))
+        c = self.make_contract([{"id": "Q1", "text": "a", "check": "pytest -q"},
+                                {"id": "Q2", "text": "b", "check": "pytest tests/test_x.py -q", "watch": ["src/**"]}], repo_checks=["npm test"])
+        w = "\n".join(core.lint_warnings(c))
+        self.assertIn("Q1: 'pytest -q' runs the whole suite", w)
+        self.assertIn("Q1: no watch/cache", w)
+        self.assertNotIn("Q2:", w)
+        self.assertIn("repo_checks without repo_watch", w)
+
+    def test_approve_dry_run_shows_cost(self):
+        self.make_contract([{"id": "Q1", "text": "slow", "check": "sleep 1; test -f README.md"},
+                            {"id": "Q2", "text": "fast", "check": "test -f README.md", "watch": ["src/**"]}])
+        os.environ["DONE_CONTRACT_SLOW_S"] = "0.5"
+        out = io.StringIO()
+        os.environ["DONE_CONTRACT_APPROVE_NO_TTY"] = "1"
+        rec = core.approve_contract(self.repo, "task-1", stdout=out)
+        text = out.getvalue()
+        self.assertIn("SLOW", text)
+        self.assertIn("re-run EVERY time the agent stops", text)
+        self.assertIn("re-run when these change: src/**", text)
+        self.assertIn("dry run: all checks together took", text)
+        self.assertGreaterEqual(rec["items"][0]["dry_run_s"], 1.0)
+        self.assertTrue(any("Q1: no watch/cache" in w for w in rec["warnings"]))
+        out2 = io.StringIO()
+        core.write_json(core.task_dir(self.repo, "task-1") / "contract.json", core.load_contract(self.repo, "task-1") | {"request": "again"})
+        core.approve_contract(self.repo, "task-1", stdout=out2, dry_run=False)
+        self.assertNotIn("dry run:", out2.getvalue())
 
 
 class TestReviewRound2(Base):

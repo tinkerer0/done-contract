@@ -58,7 +58,8 @@ v1.0은 Codex(gpt-6-astra/high) 설계 검토에서 FAIL(결함 9건), v1.1 구�
 - `items[].check`: 셸 명령(`sh -c`, cwd=repo, `CI=1`, stdin 없음, 새 세션으로 실행해 timeout 시 프로세스 그룹 kill). **한 번만 실행**하고 출력은 임시 파일로 받아 `expect`를 전체 출력에서 찾는다. 증빙에는 꼬리 40줄·출력 해시·크기만 남긴다. exit 0이고 expect(있으면)가 포함되면 PASS.
 - lint: 알 수 없는 키 거부, items 1개 이상, id 유일, check 필수·비자명, timeout 1..3600, expect 비어 있지 않은 문자열 또는 null, cache bool.
 - 강도 분류(`http`·`test`·`build`·`content`·`existence`·`other`)는 **영수증 정보일 뿐** 캐시를 결정하지 않는다. 복합 명령은 가장 약한 쪽으로 분류한다.
-- `cache: true`: 작업 트리·계약·marks가 같을 때 이전 결과 재사용. 승인 화면에 CACHED로 표시된다. repo_checks는 항상 실행한다. `verify`는 캐시를 쓰지 않는다.
+- **재실행 범위(v0.4)**: 항목마다 `"watch": ["src/auth/**", "tests/test_auth.py"]`로 의존 경로를 적으면, 이전 실행 이후 바뀐 파일이 그 글롭에 하나도 안 걸릴 때만 이전 결과를 재사용한다. `cache: true`는 "저장소 전체가 안 바뀌었을 때"로 같은 규칙의 넓은 판이다. 둘 다 없으면 매번 실행한다. 재사용 전제는 이전 실행이 같은 계약·승인·marks에서 정상 종료(ERROR·STALE·UNAPPROVED 아님)했다는 것이고, 어느 하나라도 다르면 전부 다시 돈다. `repo_checks`는 `repo_watch` 글롭이 있으면 같은 규칙을 따르고 없으면 매번 실행한다. 작은 수정은 그 항목만, 코드 전반 수정은 전체가 도는 구조다. `close`와 `verify`는 재사용 없이 전부 실행한다.
+- **승인 시 dry run**: `approve`가 각 check를 한 번 돌려 소요 시간을 보여 주고 `DONE_CONTRACT_SLOW_S`(기본 30초) 이상이면 SLOW로 표시한다. watch·cache가 없는 항목은 "매번 실행"이라고 경고하고, 대상 없는 전체 스위트 명령(`pytest -q`, `npm test` 등)은 "항목 하나에 전체 스위트"라고 경고한다. dry run 중 check가 작업 트리를 바꾸면 승인을 거부한다. `--no-dry-run`으로 끌 수 있다.
 - `allow_protected_changes: true`는 보호 경로의 추가·수정·**삭제**를 모두 허용한다. 승인 화면에 그 뜻을 표시한다.
 - 계약 해시 = 정규화 JSON의 SHA-256. 승인 기록은 해시·repo 경로·승인 시점 tree·승인 전 변경 경로를 담는다.
 

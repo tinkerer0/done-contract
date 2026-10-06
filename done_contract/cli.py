@@ -43,7 +43,8 @@ def cmd_init(args) -> int:
 def cmd_approve(args) -> int:
     repo = _repo(args)
     task = core.resolve_task(repo, args.task)
-    rec = core.approve_contract(repo, task, approver=args.approver, assume_yes=args.yes, accept_dirty=args.accept_dirty)
+    rec = core.approve_contract(repo, task, approver=args.approver, assume_yes=args.yes, accept_dirty=args.accept_dirty,
+                                dry_run=not args.no_dry_run)
     print(f"approved {task} sha256={rec['sha256']} at {rec['approved_at']}")
     return 0
 
@@ -221,7 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("init", help="create a contract skeleton for a task and make it active")
     s.add_argument("--task", required=True)
     s.add_argument("--request", required=True, help="the user's request verbatim, or @file")
-    s.add_argument("--items", help="JSON file with items [{id,text,check,expect?,timeout?,cache?}]")
+    s.add_argument("--items", help="JSON file with items [{id,text,check,expect?,timeout?,watch?,cache?}]")
     s.add_argument("--repo-check", action="append", help="repository-level check command (repeatable)")
     s.add_argument("--protected", action="append", help="protected glob (repeatable; default: common test paths)")
     s.add_argument("--allow-protected-changes", action="store_true")
@@ -233,6 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--approver")
     s.add_argument("--yes", action="store_true", help="skip the y/N prompt (still requires a TTY)")
     s.add_argument("--accept-dirty", action="store_true", help="approve even though files changed since init (recorded)")
+    s.add_argument("--no-dry-run", action="store_true", help="do not run the checks once to show their cost before approving")
     s.set_defaults(func=cmd_approve)
 
     s = sub.add_parser("check", help="run every item check and write evidence (exit 0 only for PASS)")
