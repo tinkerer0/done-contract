@@ -967,8 +967,16 @@ class TestRedTeam(Base):
                     "env rm -rf .claude", "command rm -rf .claude", "X=1 rm -rf .claude", "sudo rm -rf .grok",
                     "cp evil.json .claude/settings.json", "ln -sf /dev/null .done-contract/active",
                     # R2: cd into a control dir then act with a relative target
-                    "cd .claude && rm -f settings.json", "cd .done-contract && rm -rf slugify"):
+                    "cd .claude && rm -f settings.json", "cd .done-contract && rm -rf slugify",
+                    "pushd .claude && rm -f settings.json"):
             self.assertEqual(self.bash(cmd), "deny", cmd)
+
+    def test_cd_back_out_is_not_overblocked(self):
+        # R3: pushd/popd and cd .. return to the root; a plain file delete there is allowed
+        self.approved()
+        for cmd in ("pushd .claude && popd && rm scratch.txt", "cd .claude && cd .. && rm foo.txt",
+                    "cd subdir && rm foo.txt", "cd .claude && cp settings.json ../backup.json"):
+            self.assertIsNone(self.bash(cmd), cmd)
 
     def test_normal_commands_near_those_names_are_not_blocked(self):
         self.approved()

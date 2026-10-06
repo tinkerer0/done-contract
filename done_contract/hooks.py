@@ -464,6 +464,7 @@ def _control_dir_decision(cmd: str) -> bool:
     absolute command path, follows `cd`/`pushd` so a relative target is resolved against it, then
     checks the real target of a destructive verb (rm/mv/cp/find -delete …)."""
     cwd = Path(".")
+    stack: list[Path] = []
 
     def target_hits(tok: str) -> bool:
         t = tok.strip().strip("'\"")
@@ -485,7 +486,13 @@ def _control_dir_decision(cmd: str) -> bool:
             continue
         verb = os.path.basename(toks[0])
         args = [a for a in toks[1:] if not a.startswith("-")]
+        if verb == "popd":
+            if stack:
+                cwd = stack.pop()
+            continue
         if verb in ("cd", "pushd") and args:
+            if verb == "pushd":
+                stack.append(cwd)
             a = os.path.expanduser(args[0])
             cwd = Path(os.path.normpath(a if os.path.isabs(a) else str(cwd / a)))
             continue
