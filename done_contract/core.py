@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -219,13 +220,31 @@ def working_tree_hash(repo: Path) -> str:
     stored in the object database so later `git diff <tree> <tree>` works.
     Not covered: symlink targets outside the repo, ignored files, submodule contents.
     """
-    with tempfile.TemporaryDirectory() as td:
+    # A private index under .done-contract/ keeps git's stat cache between runs, so only
+    # files that changed get re-hashed (a fresh index re-hashes every file: ~10 s on a
+    # 20k-file tree). Each run works on its own copy and publishes it atomically, so
+    # concurrent runs can only make the cache slightly stale, never corrupt it.
+    root = contract_root(repo)
+    root.mkdir(parents=True, exist_ok=True)
+    ensure_excluded(repo)  # the index cache must never enter the tree it hashes
+    cache = root / ".index"
+    fd, work = tempfile.mkstemp(prefix=".index.", dir=str(root))
+    os.close(fd)
+    try:
         env = dict(os.environ)
-        env["GIT_INDEX_FILE"] = os.path.join(td, "index")
-        if head_sha(repo):
+        env["GIT_INDEX_FILE"] = work
+        if cache.exists():
+            shutil.copyfile(cache, work)
+        elif head_sha(repo):
             git(repo, "read-tree", "HEAD", env=env)
         git(repo, "add", "-A", "--", ".", env=env)
-        return git(repo, "write-tree", env=env).strip()
+        tree = git(repo, "write-tree", env=env).strip()
+        os.replace(work, cache)
+        return tree
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(work)
+        raise
 
 
 def changed_paths(repo: Path, tree_a: str, tree_b: str) -> list[str]:
