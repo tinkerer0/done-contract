@@ -47,7 +47,23 @@ done-contract hook install --write --require-contract   # 승인된 계약 없�
 }
 ```
 
-`init`이 `created_at`·`baseline_head`·`baseline_tree`를 채운다. 승인 뒤 이 파일을 고치면 승인이 무효가 된다. `cache: true`는 "작업 트리가 그대로면 이전 결과를 써도 된다"는 사람의 승인이다. 외부 서비스·환경·저장소 밖 파일에 의존하는 check에는 붙이지 않는다.
+`init`이 `created_at`·`baseline_head`·`baseline_tree`를 채운다. 승인 뒤 이 파일을 고치면 승인이 무효가 된다.
+
+## 무엇이 언제 다시 도는가
+
+Stop hook은 에이전트가 답을 끝낼 때마다 돈다. 매번 전부 돌리면 큰 검사가 작은 수정마다 돌기 때문에, 항목마다 의존 경로를 적어 범위를 정한다.
+
+```json
+{"id": "Q1", "text": "로그인에 분당 5회 제한", "check": "pytest tests/test_rate_limit.py -q", "watch": ["src/auth/**", "tests/test_rate_limit.py"]}
+```
+
+- `watch`가 있으면 이전 실행 이후 바뀐 파일이 그 경로에 걸릴 때만 다시 돈다. README만 고친 턴에는 안 돈다.
+- `"cache": true`는 "저장소 어디든 바뀌면 다시"라는 넓은 판이다.
+- 둘 다 없으면 매번 돈다. 외부 서비스·환경·저장소 밖 파일에 의존하는 check는 이렇게 둔다.
+- `repo_checks`에는 `"repo_watch": ["src/**", "tests/**"]`를 같이 적으면 코드가 바뀐 턴에만 전체 스위트가 돈다.
+- 계약·승인·마크가 바뀌었거나 이전 실행이 ERROR·STALE이면 재사용 없이 전부 다시 돈다. `close`와 `verify`도 전부 돈다.
+
+승인할 때 각 check를 한 번 돌려 소요 시간을 보여 준다. 30초 넘으면 SLOW, watch가 없으면 "매번 실행" 경고, 대상 없는 전체 스위트(`pytest -q`, `npm test`)는 "항목 하나에 전체 스위트" 경고가 붙는다. 그 화면을 보고 항목을 좁히거나 watch를 적은 뒤 승인한다.
 
 ## 판정
 
