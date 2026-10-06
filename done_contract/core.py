@@ -23,7 +23,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 CONTRACT_DIRNAME = ".done-contract"
 
 DEFAULT_PROTECTED = [
@@ -231,27 +231,63 @@ def working_tree_hash(repo: Path) -> str:
     # files that changed get re-hashed (a fresh index re-hashes every file: ~10 s on a
     # 20k-file tree). Each run works on its own copy and publishes it atomically, so
     # concurrent runs can only make the cache slightly stale, never corrupt it.
+    # The copy keeps the index file's own timestamp (copy2): git's racy-stat guard
+    # re-reads files modified in the same second as that timestamp, which a newer
+    # timestamp would silently disable. The cache is rebuilt from HEAD whenever HEAD
+    # or any ignore rule changes, because `git add -A` never drops an entry that merely
+    # became ignored.
     root = contract_root(repo)
     root.mkdir(parents=True, exist_ok=True)
     ensure_excluded(repo)  # the index cache must never enter the tree it hashes
     cache = root / ".index"
+    keyfile = root / ".index.key"
+    key = _index_cache_key(repo)
     fd, work = tempfile.mkstemp(prefix=".index.", dir=str(root))
     os.close(fd)
     try:
         env = dict(os.environ)
         env["GIT_INDEX_FILE"] = work
-        if cache.exists():
-            shutil.copyfile(cache, work)
-        elif head_sha(repo):
-            git(repo, "read-tree", "HEAD", env=env)
-        git(repo, "add", "-A", "--", ".", env=env)
+        reuse_cache = cache.exists() and keyfile.exists() and keyfile.read_text(encoding="utf-8").strip() == key
+        if reuse_cache:
+            shutil.copy2(cache, work)
+        else:
+            os.unlink(work)  # let git create a valid index file itself
+            if head_sha(repo):
+                git(repo, "read-tree", "HEAD", env=env)
+            else:
+                git(repo, "read-tree", "--empty", env=env)
+        git(repo, "-c", "core.checkStat=default", "-c", "core.trustctime=true", "add", "-A", "--", ".", env=env)
         tree = git(repo, "write-tree", env=env).strip()
         os.replace(work, cache)
+        keyfile.write_text(key + "\n", encoding="utf-8")
         return tree
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(work)
         raise
+
+
+def _index_cache_key(repo: Path) -> str:
+    """HEAD plus every ignore source: when any of them changes the private index is rebuilt."""
+    h = hashlib.sha256()
+    h.update((head_sha(repo) or "unborn").encode("utf-8"))
+    listing = git(repo, "ls-files", "-co", "--exclude-standard", "-z", "--", ".gitignore", ":(glob)**/.gitignore", check=False, binary=True)
+    for raw in sorted(p for p in listing.split(b"\0") if p):
+        h.update(b"\0" + raw)
+        with contextlib.suppress(OSError):
+            h.update(Path(repo, raw.decode("utf-8", "replace")).read_bytes())
+    sources = []
+    with contextlib.suppress(GitError):
+        ex = git(repo, "rev-parse", "--git-path", "info/exclude").strip()
+        sources.append(Path(ex) if os.path.isabs(ex) else repo / ex)
+    extra = git(repo, "config", "--get", "core.excludesFile", check=False).strip()
+    if extra:
+        sources.append(Path(os.path.expanduser(extra)))
+    for src in sources:
+        h.update(b"\0" + str(src).encode("utf-8"))
+        with contextlib.suppress(OSError):
+            h.update(src.read_bytes())
+    return h.hexdigest()
 
 
 def changed_paths(repo: Path, tree_a: str, tree_b: str) -> list[str]:
@@ -286,7 +322,39 @@ def ensure_excluded(repo: Path) -> None:
 
 # ---------------------------------------------------------------- globs and paths
 
+def normalize_glob(pattern: str) -> str:
+    """Repo-relative POSIX form: `./a` → `a`, `a//b` → `a/b`, `dir/` → `dir/**`."""
+    p = pattern.replace(os.sep, "/")
+    while p.startswith("./"):
+        p = p[2:]
+    while "//" in p:
+        p = p.replace("//", "/")
+    if p.endswith("/"):
+        p += "**"
+    return p
+
+
+def glob_problem(pattern: str) -> str | None:
+    """Why a pattern is not accepted: only `*`, `**`, `?` and `[…]` classes are supported."""
+    p = normalize_glob(pattern)
+    if not p.strip():
+        return "empty pattern"
+    if "{" in p or "}" in p:
+        return "brace sets like {a,b} are not supported; list each pattern separately"
+    i = 0
+    while i < len(p):
+        if p[i] == "[":
+            j = p.find("]", i + 2)
+            if j < 0:
+                return "unbalanced '[' (write '[[]' for a literal bracket)"
+            i = j + 1
+        else:
+            i += 1
+    return None
+
+
 def glob_to_regex(pattern: str) -> re.Pattern:
+    pattern = normalize_glob(pattern)
     out = ""
     i = 0
     n = len(pattern)
@@ -304,6 +372,19 @@ def glob_to_regex(pattern: str) -> re.Pattern:
             out += "[^/]*"
         elif c == "?":
             out += "[^/]"
+        elif c == "[":
+            j = pattern.find("]", i + 2)
+            if j < 0:
+                out += re.escape(c)
+            else:
+                body = pattern[i + 1:j]
+                negate = body.startswith(("!", "^"))
+                if negate:
+                    body = body[1:]
+                body = body.replace("\\", "\\\\").replace("]", "\\]")
+                out += "[" + ("^" if negate else "") + body + "]"
+                i = j + 1
+                continue
         else:
             out += re.escape(c)
         i += 1
@@ -504,13 +585,26 @@ def lint_contract(contract: dict) -> list[str]:
             problems.append(f"{where}.expect must be a non-empty string or null")
         if "cache" in item and not isinstance(item["cache"], bool):
             problems.append(f"{where}.cache must be true or false")
-        if "watch" in item and (not isinstance(item["watch"], list) or not item["watch"]
-                                or not all(isinstance(g, str) and g.strip() for g in item["watch"])):
-            problems.append(f"{where}.watch must be a non-empty list of path globs")
+        if "watch" in item:
+            if not isinstance(item["watch"], list) or not item["watch"] or not all(isinstance(g, str) and g.strip() for g in item["watch"]):
+                problems.append(f"{where}.watch must be a non-empty list of path globs")
+            else:
+                for g in item["watch"]:
+                    why = glob_problem(g)
+                    if why:
+                        problems.append(f"{where}.watch '{g}': {why}")
     repo_watch = contract.get("repo_watch")
-    if repo_watch is not None and (not isinstance(repo_watch, list) or not repo_watch
-                                   or not all(isinstance(g, str) and g.strip() for g in repo_watch)):
-        problems.append("repo_watch must be a non-empty list of path globs")
+    if repo_watch is not None:
+        if not isinstance(repo_watch, list) or not repo_watch or not all(isinstance(g, str) and g.strip() for g in repo_watch):
+            problems.append("repo_watch must be a non-empty list of path globs")
+        else:
+            for g in repo_watch:
+                why = glob_problem(g)
+                if why:
+                    problems.append(f"repo_watch '{g}': {why}")
+    for g in contract.get("protected", []) or []:
+        if isinstance(g, str) and glob_problem(g):
+            problems.append(f"protected '{g}': {glob_problem(g)}")
     repo_checks = contract.get("repo_checks", [])
     if not isinstance(repo_checks, list):
         problems.append("repo_checks must be a list of commands")
@@ -616,6 +710,8 @@ def find_approval(repo: Path, contract: dict) -> dict | None:
         return None
     if rec.get("repo") and Path(rec["repo"]).resolve() != Path(repo).resolve():
         return None
+    # identity of this approval record: evidence from an earlier approval is never reused under a new one
+    rec["approval_id"] = sha256_bytes(canonical_json({k: v for k, v in rec.items() if k != "approval_id"}))
     return rec
 
 
@@ -709,7 +805,7 @@ def render_contract_summary(contract: dict, timings: dict | None = None, slow_s:
         timing = ""
         if timings and it.get("id") in timings:
             t = timings[it["id"]]
-            timing = f" — {t['duration_s']}s" + (" SLOW" if t["duration_s"] >= slow_s else "") + (" (timed out)" if t.get("timed_out") else "")
+            timing = f" — {t['duration_s']}s {t.get('status', '')}".rstrip() + (" SLOW" if t["duration_s"] >= slow_s else "")
         lines.append(f"  {it.get('id')}: {it.get('text')}")
         lines.append(f"      check [{strength_of(check)}]: {check}")
         lines.append(f"      {when}{timing}")
@@ -722,7 +818,7 @@ def render_contract_summary(contract: dict, timings: dict | None = None, slow_s:
             for cmd in contract["repo_checks"]:
                 t = timings.get("repo:" + cmd)
                 if t:
-                    lines.append(f"      {cmd}: {t['duration_s']}s" + (" SLOW" if t["duration_s"] >= slow_s else ""))
+                    lines.append(f"      {cmd}: {t['duration_s']}s {t.get('status', '')}".rstrip() + (" SLOW" if t["duration_s"] >= slow_s else ""))
     lines.append(f"protected: {', '.join(contract.get('protected', [])) or '(none)'}")
     if contract.get("allow_protected_changes"):
         lines.append("allow_protected_changes: true — the agent may add, change AND delete files under protected paths")
@@ -741,13 +837,24 @@ def render_contract_summary(contract: dict, timings: dict | None = None, slow_s:
 
 def dry_run_checks(repo: Path, contract: dict) -> dict:
     """Run every check once (no evidence is written) to show the person what approval costs."""
+    def status_of(res: dict) -> str:
+        if res["timed_out"]:
+            return "TIMEOUT"
+        if res["exit"] != 0:
+            return f"FAIL(exit {res['exit']})"
+        if res.get("expect_matched") is False:
+            return "FAIL(expect mismatch)"
+        return "PASS"
+
     timings: dict[str, dict] = {}
     for it in contract.get("items", []):
         res = run_command(it["check"], repo, float(it.get("timeout", DEFAULT_ITEM_TIMEOUT)), expect=it.get("expect"))
-        timings[it["id"]] = {"duration_s": res["duration_s"], "exit": res["exit"], "timed_out": res["timed_out"]}
+        timings[it["id"]] = {"duration_s": res["duration_s"], "exit": res["exit"], "timed_out": res["timed_out"],
+                             "expect_matched": res.get("expect_matched"), "status": status_of(res)}
     for cmd in contract.get("repo_checks", []):
         res = run_command(cmd, repo, float(REPO_CHECK_TIMEOUT))
-        timings["repo:" + cmd] = {"duration_s": res["duration_s"], "exit": res["exit"], "timed_out": res["timed_out"]}
+        timings["repo:" + cmd] = {"duration_s": res["duration_s"], "exit": res["exit"], "timed_out": res["timed_out"],
+                                  "expect_matched": None, "status": status_of(res)}
     return timings
 
 
@@ -950,10 +1057,12 @@ def evidence_is_current(repo: Path, task: str, ev: dict | None, contract: dict, 
     if not ev:
         return False
     try:
+        approval = find_approval(repo, contract)
         return (ev.get("task") == task and ev.get("repo") == str(repo)
                 and not ev.get("in_progress")
                 and ev.get("contract_sha256") == contract_sha(contract)
-                and find_approval(repo, contract) is not None
+                and approval is not None
+                and ev.get("approval_id") == approval.get("approval_id")
                 and ev.get("marks_sha256") == marks_digest(marks)
                 and ev.get("tree") == tree
                 and ev.get("tool_version") == VERSION
@@ -1009,6 +1118,7 @@ def _run_check_locked(repo: Path, task: str, *, reuse: bool, session: str | None
         "tool": "done-contract", "tool_version": VERSION, "task": task, "repo": str(repo),
         "contract_sha256": csha, "tree": tree_before, "baseline_tree": contract.get("baseline_tree"),
         "marks_sha256": msha, "session": session,
+        "approval_id": (approval or {}).get("approval_id"),
     }
     if approval is None:
         evidence = {**base, "verdict": VERDICT_UNAPPROVED, "checked_at": now_iso(), "items": [], "repo_checks": [],
@@ -1250,7 +1360,7 @@ def close_contract(repo: Path, task: str) -> dict:
             raise DoneContractError("already closed")
         if contract_state(repo, task) != "approved":
             raise DoneContractError(f"contract is {contract_state(repo, task)}; only an approved contract can be closed")
-        ev = _run_check_locked(repo, task, reuse=True, session=None, budget_s=None)
+        ev = _run_check_locked(repo, task, reuse=False, session=None, budget_s=None)  # close never reuses
         if ev.get("verdict") not in ALLOW_STOP_VERDICTS:
             raise DoneContractError(f"close refused: fresh check verdict is {ev.get('verdict')} "
                                     "(needs PASS, INCOMPLETE or PAUSED); see evidence.md")

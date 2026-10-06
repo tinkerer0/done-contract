@@ -824,6 +824,124 @@ class TestScopedReuse(Base):
         self.assertNotIn("dry run:", out2.getvalue())
 
 
+class TestReviewV04(Base):
+    """Regressions for the v0.4 Codex review (F1-F6, L1)."""
+
+    def fresh_tree(self, repo):
+        """v0.3-style hash with a throwaway index: the reference the cache must agree with."""
+        with tempfile.TemporaryDirectory() as td:
+            env = dict(os.environ, GIT_INDEX_FILE=os.path.join(td, "index"))
+            if core.head_sha(repo):
+                core.git(repo, "read-tree", "HEAD", env=env)
+            else:
+                core.git(repo, "read-tree", "--empty", env=env)
+            core.git(repo, "add", "-A", "--", ".", env=env)
+            return core.git(repo, "write-tree", env=env).strip()
+
+    def test_same_second_same_size_edit_is_detected(self):
+        target = self.repo / "input.txt"
+        target.write_text("GOOD\n")
+        h1 = core.working_tree_hash(self.repo)
+        target.write_text("FAIL\n")  # same size, same second
+        time.sleep(1.2)
+        h2 = core.working_tree_hash(self.repo)
+        self.assertNotEqual(h1, h2)
+        self.assertEqual(h2, self.fresh_tree(self.repo))
+        st = target.stat()
+        target.write_text("GOOD\n")
+        os.utime(target, (st.st_atime, st.st_mtime))  # mtime preserved, content changed
+        time.sleep(1.2)
+        h3 = core.working_tree_hash(self.repo)
+        self.assertEqual(h3, h1)
+        self.assertEqual(h3, self.fresh_tree(self.repo))
+
+    def test_watch_patterns_dot_prefix_and_class(self):
+        for pattern in ("./input.txt", "[i]nput.txt", "src//**", "docs/"):
+            self.assertIsNone(core.glob_problem(pattern), pattern)
+        self.assertTrue(core.matches_any("input.txt", ["./input.txt"]))
+        self.assertTrue(core.matches_any("input.txt", ["[i]nput.txt"]))
+        self.assertFalse(core.matches_any("input.txt", ["[!i]nput.txt"]))
+        self.assertTrue(core.matches_any("docs/a/b.md", ["docs/"]))
+        self.assertTrue(core.matches_any("src/a.py", ["src//**"]))
+        self.assertIn("brace", core.glob_problem("src/{a,b}/**"))
+        self.assertIn("unbalanced", core.glob_problem("src/[abc"))
+        c = self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md", "watch": ["src/{a,b}/**"]}])
+        self.assertTrue(any("brace" in p for p in core.lint_contract(c)))
+        counter, cmd = Path(self.tmp.name) / "c", f"echo run >> {Path(self.tmp.name) / 'c'}; test -f README.md"
+        c = self.make_contract([{"id": "Q1", "text": "a", "check": cmd, "watch": ["./input.txt"]}])
+        (self.repo / "input.txt").write_text("GOOD\n")
+        self.approve(dry_run=False, accept_dirty=True)
+        core.run_check(self.repo, "task-1")
+        (self.repo / "input.txt").write_text("BAD INPUT\n")
+        ev = core.run_check(self.repo, "task-1")
+        self.assertFalse(ev["items"][0]["reused"])
+        self.assertEqual(counter.read_text().count("run"), 2)
+
+    def test_close_reruns_everything(self):
+        c1 = Path(self.tmp.name) / "c1"
+        cr = Path(self.tmp.name) / "cr"
+        c = self.make_contract([{"id": "Q1", "text": "a", "check": f"echo run >> {c1}; test -f README.md", "watch": ["src/**"]}],
+                               repo_checks=[f"echo run >> {cr}; test -f README.md"])
+        c["repo_watch"] = ["src/**"]
+        core.write_json(core.task_dir(self.repo, "task-1") / "contract.json", c)
+        self.approve(dry_run=False)
+        core.run_check(self.repo, "task-1")
+        core.run_check(self.repo, "task-1")  # nothing changed: reused
+        self.assertEqual((c1.read_text().count("run"), cr.read_text().count("run")), (1, 1))
+        ev = core.close_contract(self.repo, "task-1")
+        self.assertEqual(ev["verdict"], core.VERDICT_PASS)
+        self.assertFalse(ev["reused"])
+        self.assertEqual((c1.read_text().count("run"), cr.read_text().count("run")), (2, 2))
+
+    def test_unborn_repository(self):
+        repo = Path(self.tmp.name) / "unborn"
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", "main")
+        (repo / "input.txt").write_text("x\n")
+        repo = repo.resolve()
+        h = core.working_tree_hash(repo)
+        self.assertEqual(h, self.fresh_tree(repo))
+        c = core.init_contract(repo, "t", "req")
+        self.assertEqual(c["baseline_tree"], h)
+        self.assertIsNone(c["baseline_head"])
+
+    def test_new_ignore_rule_rebuilds_the_cache(self):
+        (self.repo / "generated.txt").write_text("g\n")
+        h_with = core.working_tree_hash(self.repo)
+        (self.repo / ".gitignore").write_text("generated.txt\n")
+        h_after = core.working_tree_hash(self.repo)
+        self.assertEqual(h_after, self.fresh_tree(self.repo))
+        self.assertEqual(sorted(core.changed_paths(self.repo, h_with, h_after)), [".gitignore", "generated.txt"])
+        self.assertEqual(core.working_tree_hash(self.repo), h_after)
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "ignore")  # HEAD change also rebuilds
+        self.assertEqual(core.working_tree_hash(self.repo), self.fresh_tree(self.repo))
+
+    def test_reapproval_invalidates_previous_results(self):
+        counter = Path(self.tmp.name) / "c"
+        self.make_contract([{"id": "Q1", "text": "a", "check": f"echo run >> {counter}; test -f README.md", "watch": ["src/**"]}])
+        self.approve(dry_run=False)
+        ev1 = core.run_check(self.repo, "task-1")
+        self.assertEqual(counter.read_text().count("run"), 1)
+        time.sleep(1.1)
+        self.approve(dry_run=False, approver="someone-else")
+        ev2 = core.run_check(self.repo, "task-1")
+        self.assertNotEqual(ev1["approval_id"], ev2["approval_id"])
+        self.assertFalse(ev2["items"][0]["reused"])
+        self.assertEqual(counter.read_text().count("run"), 2)
+
+    def test_dry_run_shows_failures(self):
+        self.make_contract([{"id": "Q1", "text": "a", "check": "printf WRONG", "expect": "EXPECTED"},
+                            {"id": "Q2", "text": "b", "check": "exit 7"}], repo_checks=["exit 3"])
+        out = io.StringIO()
+        os.environ["DONE_CONTRACT_APPROVE_NO_TTY"] = "1"
+        core.approve_contract(self.repo, "task-1", stdout=out)
+        text = out.getvalue()
+        self.assertIn("FAIL(expect mismatch)", text)
+        self.assertIn("FAIL(exit 7)", text)
+        self.assertIn("FAIL(exit 3)", text)
+
+
 class TestReviewRound2(Base):
     """Regressions for the second Codex review (N1-N6)."""
 

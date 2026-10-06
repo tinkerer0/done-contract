@@ -179,4 +179,16 @@ HMAC의 보장: 증빙 파일의 손 편집·손상을 감지한다. 키는 사�
 | N6 HMAC 키 생성 경쟁 | 임시 파일에 완전히 쓴 뒤 `os.link`로 원자 공개, 읽을 때 64 hex 검증(빈 파일은 오류) |
 | 질문 2 200 MiB 검색 한계 | 한계 초과이면서 expect 미발견이면 항목 ERROR |
 
-미해결: systemMessage가 대화형 화면에 보이는지(headless에서는 관측 불가). 셸 명령의 쓰기 판정은 원리적으로 불완전하다(§8). check 로그 실패는 CLI에는 표시하지 않는다(질문 1, 범위 밖으로 둠).
+### v0.4 검토 (F1~F6·L1, v0.4.1에 반영)
+
+| 결함 | 반영 |
+|---|---|
+| F1 영속 index 복사가 timestamp를 잃어 같은 초 같은 크기 수정을 못 봄 | `shutil.copy2`로 index 파일 timestamp 보존(git의 racy-stat 재확인 유지), `git add`에 `core.checkStat=default`·`core.trustctime=true` 강제. 같은 초·mtime 보존 수정 테스트 |
+| F2 `./input.txt`·`[i]nput.txt` watch가 승인되지만 매칭 실패 | 패턴 정규화(`./`, `//`, `dir/`→`dir/**`), 문자 클래스 지원, brace·불균형 괄호는 lint 거부. protected도 같은 검사 |
+| F3 close가 재사용함 | close는 `reuse=False` |
+| F4 커밋 없는 저장소에서 빈 index 파일 오류 | 캐시 없으면 git이 index를 만들게 하고 HEAD 없으면 `read-tree --empty` |
+| F5 새 ignore 규칙이 영속 index의 과거 항목에 미적용 | 캐시 키 = HEAD + 모든 ignore 소스(.gitignore 전부·info/exclude·core.excludesFile) 해시. 바뀌면 HEAD에서 재구성 |
+| F6 재승인 뒤 이전 승인의 결과 재사용 | 승인 기록 해시 `approval_id`를 증빙에 기록하고 현재성 판정에서 비교 |
+| L1 dry run이 실패를 안 보여줌 | 소요 시간 옆에 PASS/FAIL(exit n)/FAIL(expect mismatch)/TIMEOUT 표시 |
+
+미해결: systemMessage가 대화형 화면에 보이는지(headless에서는 관측 불가). 셸 명령의 쓰기 판정은 원리적으로 불완전하다(§8). check 로그 실패는 CLI에는 표시하지 않는다(질문 1, 범위 밖으로 둠). git 작업 트리 해시는 ignored 파일·symlink 대상·submodule 내부·저장소 밖 입력을 포함하지 않으므로 그런 입력에 의존하는 항목에는 watch를 쓰지 않는다.
