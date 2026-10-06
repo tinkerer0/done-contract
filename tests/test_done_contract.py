@@ -31,7 +31,7 @@ class Base(unittest.TestCase):
         self.repo.mkdir()
         self._env_backup = dict(os.environ)
         os.environ["DONE_CONTRACT_HOME"] = str(self.home)
-        for k in ("DONE_CONTRACT_APPROVE_NO_TTY", "DONE_CONTRACT_MAX_BLOCKS", "DONE_CONTRACT_STOP_BUDGET"):
+        for k in ("DONE_CONTRACT_APPROVE_NO_TTY", "DONE_CONTRACT_MAX_BLOCKS", "DONE_CONTRACT_STOP_BUDGET", "CLAUDE_PROJECT_DIR"):
             os.environ.pop(k, None)
         git(self.repo, "init", "-q", "-b", "main")
         git(self.repo, "config", "user.email", "t@example.com")
@@ -941,6 +941,81 @@ class TestReviewV04(Base):
         self.assertIn("FAIL(expect mismatch)", text)
         self.assertIn("FAIL(exit 7)", text)
         self.assertIn("FAIL(exit 3)", text)
+
+
+class TestCwdIndependence(Base):
+    """Live test T5: the agent `cd`ed out of the repository and the hooks judged the wrong one."""
+
+    def other_repo(self):
+        o = Path(self.tmp.name) / "other"
+        o.mkdir()
+        git(o, "init", "-q", "-b", "main")
+        return o.resolve()
+
+    def test_stop_follows_project_dir_when_cwd_moves(self):
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f missing.md"}])
+        self.approve(dry_run=False)
+        elsewhere = self.other_repo()
+        os.environ["CLAUDE_PROJECT_DIR"] = str(self.repo)
+        out = hooks.stop({"session_id": "s", "cwd": str(elsewhere), "stop_hook_active": False})
+        self.assertEqual(out["decision"], "block")
+        out = hooks.stop({"session_id": "s2", "cwd": self.tmp.name, "stop_hook_active": False})  # not a repo at all
+        self.assertEqual(out["decision"], "block")
+
+    def test_edit_is_judged_by_the_target_files_repo(self):
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}])
+        self.approve(dry_run=False)
+        elsewhere = self.other_repo()
+        os.environ["CLAUDE_PROJECT_DIR"] = str(self.repo)
+
+        def d(fp, **kw):
+            out = hooks.pretool({"session_id": "s", "cwd": str(elsewhere), "tool_name": "Edit", "tool_input": {"file_path": fp}}, **kw)
+            return out["hookSpecificOutput"]["permissionDecision"] if out else None
+
+        self.assertEqual(d(str(self.repo / "tests" / "test_a.py")), "deny")  # protected file, shell elsewhere
+        self.assertIsNone(d(str(self.repo / "app.py"), require_contract=True))  # the T5 false denial
+        self.assertIsNone(d(str(elsewhere / "x.py"), require_contract=True))  # another repo is outside this project's policy
+        self.assertEqual(d(str(self.repo / ".done-contract" / "task-1" / "contract.json")), "deny")
+
+    def test_bash_is_judged_for_the_project_even_from_elsewhere(self):
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}])
+        self.approve(dry_run=False)
+        elsewhere = self.other_repo()
+        os.environ["CLAUDE_PROJECT_DIR"] = str(self.repo)
+
+        def d(cmd, **kw):
+            out = hooks.pretool({"session_id": "s", "cwd": str(elsewhere), "tool_name": "Bash", "tool_input": {"command": cmd}}, **kw)
+            return out["hookSpecificOutput"]["permissionDecision"] if out else None
+
+        self.assertEqual(d(f"rm {self.repo}/tests/test_a.py"), "ask")
+        self.assertIsNone(d(f"cd {self.repo} && done-contract status", require_contract=True))  # approved project: no policy
+        self.assertIsNone(d("rm conftest.py"))  # bare name while outside the repo: not this repo's file
+        self.assertEqual(d("done-contract approve"), "deny")
+
+    def test_without_project_dir_edits_still_use_the_target_repo(self):
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}])
+        self.approve(dry_run=False)
+        elsewhere = self.other_repo()
+        out = hooks.pretool({"session_id": "s", "cwd": str(elsewhere), "tool_name": "Write",
+                             "tool_input": {"file_path": str(self.repo / "tests" / "test_new.py")}})
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_ignored_build_output_under_tests_is_not_flagged(self):
+        (self.repo / ".gitignore").write_text("__pycache__/\n*.pyc\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "ignore")
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}])
+        self.approve(dry_run=False)
+        (self.repo / "tests" / "__pycache__").mkdir()
+        (self.repo / "tests" / "__pycache__" / "test_a.cpython-314.pyc").write_bytes(b"x")
+
+        def d(cmd):
+            out = hooks.pretool({"session_id": "s", "cwd": str(self.repo), "tool_name": "Bash", "tool_input": {"command": cmd}})
+            return out["hookSpecificOutput"]["permissionDecision"] if out else None
+
+        self.assertIsNone(d("python3 -m unittest -q; rm -rf tests/__pycache__"))
+        self.assertEqual(d("rm tests/test_a.py"), "ask")
+        self.assertEqual(core.run_check(self.repo, "task-1")["verdict"], core.VERDICT_PASS)  # ignored pyc is not a protected change
 
 
 class TestReviewV04b(Base):

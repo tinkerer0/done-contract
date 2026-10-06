@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 from pathlib import Path
 
 from . import core
@@ -73,16 +74,58 @@ def _save_state(key: str, state: dict) -> None:
     core.write_json(_state_path(key), state, mode=0o600)
 
 
-def _repo_and_task(payload: dict) -> tuple[Path | None, str | None]:
-    cwd = payload.get("cwd") or os.getcwd()
+def _repo_of(path) -> Path | None:
+    """Git top level of an existing path, or of its nearest existing ancestor."""
+    if not path:
+        return None
+    p = Path(path)
+    while not p.exists() and not p.is_symlink():
+        if p.parent == p:
+            return None
+        p = p.parent
     try:
-        repo = core.repo_root(Path(cwd))
+        return core.repo_root(p)
     except core.GitError:
-        return None, None
+        return None
+
+
+def _payload_cwd(payload: dict) -> Path:
+    return Path(payload.get("cwd") or os.getcwd())
+
+
+def _project_repo(payload: dict) -> Path | None:
+    """The repository the hooks were installed for. Claude Code gives hooks CLAUDE_PROJECT_DIR,
+    which stays fixed when the agent `cd`s elsewhere; the payload cwd follows the shell."""
+    project = os.environ.get("CLAUDE_PROJECT_DIR")
+    repo = _repo_of(project) if project else None
+    return repo or _repo_of(_payload_cwd(payload))
+
+
+def _candidate_repos(payload: dict) -> list[Path]:
+    out: list[Path] = []
+    for repo in (_project_repo(payload), _repo_of(_payload_cwd(payload))):
+        if repo is not None and repo not in out:
+            out.append(repo)
+    return out
+
+
+def _active_task(repo: Path) -> str | None:
     task = core.active_task(repo)
-    if not task or not (core.task_dir(repo, task) / "contract.json").exists():
-        return repo, None
-    return repo, task
+    if task and (core.task_dir(repo, task) / "contract.json").exists():
+        return task
+    return None
+
+
+def _approved_task(repo: Path) -> str | None:
+    task = _active_task(repo)
+    if task and core.contract_state(repo, task) == "approved":
+        return task
+    return None
+
+
+def _is_ignored(repo: Path, rel: str) -> bool:
+    proc = subprocess.run(["git", "check-ignore", "-q", "--", rel], cwd=str(repo), capture_output=True)
+    return proc.returncode == 0
 
 
 def _max_blocks() -> int:
@@ -147,15 +190,35 @@ def _with_log_note(message: str, logged: bool) -> str:
 
 
 def stop(payload: dict, *, require_contract: bool = False) -> dict | None:
-    repo, task = _repo_and_task(payload)
-    if repo is None:
+    """Gate every repository this session is working in: the project the hooks belong to
+    (CLAUDE_PROJECT_DIR) and the shell's current repository, so a `cd` cannot skip the gate."""
+    repos = _candidate_repos(payload)
+    if not repos:
         return None
     session = str(payload.get("session_id") or "unknown")
-    if task is None:
+    results = []
+    any_active = False
+    for repo in repos:
+        task = _active_task(repo)
+        if task is None:
+            continue
+        any_active = True
+        res = _stop_one(repo, task, session, require_contract)
+        if res:
+            results.append(res)
+    if not any_active:
         if require_contract:
             return {"systemMessage": "done-contract: 이 저장소는 계약이 필요하다(require-contract). 승인된 계약이 없으면 파일 변경이 거부된다. "
                                      "`done-contract init --task <slug> --request ...` 뒤 사람이 `done-contract approve`를 실행한다."}
         return None
+    blocking = [r for r in results if r.get("decision") == "block"]
+    if blocking:
+        return {"decision": "block", "reason": "\n\n".join(r["reason"] for r in blocking)}
+    messages = [r["systemMessage"] for r in results if r.get("systemMessage")]
+    return {"systemMessage": "\n".join(messages)} if messages else None
+
+
+def _stop_one(repo: Path, task: str, session: str, require_contract: bool) -> dict | None:
     contract = core.load_contract(repo, task)
     state_name = core.contract_state(repo, task)
     if state_name in ("closed", "abandoned"):
@@ -214,19 +277,6 @@ def _ask(reason: str) -> dict:
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask", "permissionDecisionReason": reason}}
 
 
-def _payload_cwd(payload: dict, repo: Path) -> Path:
-    cwd = payload.get("cwd")
-    return Path(cwd) if cwd else repo
-
-
-def _edit_target(payload: dict, repo: Path) -> tuple[str | None, str | None] | None:
-    inp = payload.get("tool_input") or {}
-    fp = inp.get("file_path") or inp.get("notebook_path")
-    if not fp:
-        return None
-    return core.repo_relative(repo, fp, _payload_cwd(payload, repo))
-
-
 def _protected_hit(lexical: str | None, resolved: str | None, protected: list[str]) -> str | None:
     for rel in (lexical, resolved):
         if rel and core.matches_any(rel, protected):
@@ -272,70 +322,99 @@ def _bash_policy_without_contract(cmd: str) -> dict | None:
     return None
 
 
+def _edit_decision(repo: Path, task: str, target: Path) -> dict | None:
+    contract = core.load_contract(repo, task)
+    protected = contract.get("protected", [])
+    allow = bool(contract.get("allow_protected_changes"))
+    lexical, resolved = core.repo_relative(repo, target)
+    if lexical is None and resolved is None:
+        return None
+    if lexical == f"{core.CONTRACT_DIRNAME}/{task}/contract.json":
+        return _deny(f"done-contract: 승인된 계약 '{task}'은 변경할 수 없다. 기준을 바꾸려면 사람에게 새 revision 승인을 요청하라.")
+    if (lexical or "").startswith(f"{core.CONTRACT_DIRNAME}/") or (resolved or "").startswith(f"{core.CONTRACT_DIRNAME}/"):
+        return _deny("done-contract: 증빙·상태 파일은 도구 명령(mark, pause, check)으로만 바꾼다.")
+    hit = None if allow else _protected_hit(lexical, resolved, protected)
+    if hit:
+        return _deny(f"done-contract: '{hit}'은 계약 '{task}'의 보호 경로다. 테스트 대신 테스트 대상 코드를 고쳐라. "
+                     "테스트 변경이 작업에 포함되면 사람에게 allow_protected_changes 재승인을 요청하라.")
+    return None
+
+
+def _bash_decision(repo: Path, task: str, cmd: str, cwd: Path) -> dict | None:
+    contract = core.load_contract(repo, task)
+    protected = contract.get("protected", [])
+    allow = bool(contract.get("allow_protected_changes"))
+    if STATE_PATH_RE.search(cmd) and (WRITE_HINT_RE.search(cmd) or HEREDOC_RE.search(cmd)):
+        return _deny("done-contract: .done-contract 상태 파일은 도구 명령(mark, pause, check)으로만 바꾼다.")
+    if allow or not (WRITE_HINT_RE.search(cmd) or HEREDOC_RE.search(cmd)):
+        return None
+    try:
+        tokens = shlex.split(cmd, posix=True)
+    except ValueError:
+        tokens = cmd.split()
+    cwd_inside = core.repo_relative(repo, cwd)[0] is not None
+    for tok in tokens:
+        t = tok.strip("'\"")
+        if not t or t.startswith("-"):
+            continue
+        if "/" in t or t.startswith(".") or os.path.exists(cwd / t):
+            lexical, resolved = core.repo_relative(repo, t, cwd)
+        elif cwd_inside:
+            lexical, resolved = core.normalize_rel(t), None
+        else:
+            continue
+        hit = _protected_hit(lexical, resolved, protected)
+        if hit and not _is_ignored(repo, hit):  # ignored build output under tests/ (e.g. __pycache__) is not a test change
+            return _ask(f"done-contract: 이 명령은 보호 경로 '{hit}'를 바꿀 수 있다(계약 '{task}'). 허용할지 사람이 정한다.")
+    return None
+
+
 def pretool(payload: dict, *, require_contract: bool = False) -> dict | None:
+    """Edits are judged by the repository that contains the edited file; shell commands by the
+    project repository and the shell's current repository. The require-contract policy covers
+    the project repository (where the hooks are installed)."""
     tool = payload.get("tool_name")
     inp = payload.get("tool_input") or {}
-    repo, task = _repo_and_task(payload)
-    if repo is None:
-        return None
-    contract = core.load_contract(repo, task) if task else None
-    state_name = core.contract_state(repo, task) if task else "none"
-    gate_on = state_name == "approved"
-    if not gate_on:
-        if not require_contract:
+    cwd = _payload_cwd(payload)
+    project = _project_repo(payload)
+    if tool in EDIT_TOOLS:
+        fp = inp.get("file_path") or inp.get("notebook_path")
+        if not fp:
             return None
-        if tool in EDIT_TOOLS:
-            target = _edit_target(payload, repo)
-            if target is None:
-                return None
-            lexical, resolved = target
+        target = Path(fp) if Path(fp).is_absolute() else cwd / fp
+        target = Path(os.path.normpath(str(target)))
+        repos: list[Path] = []
+        for r in (_repo_of(target), _repo_of(target.resolve())):
+            if r is not None and r not in repos:
+                repos.append(r)
+        for repo in repos:
+            task = _approved_task(repo)
+            if task:
+                decision = _edit_decision(repo, task, target)
+                if decision:
+                    return decision
+        if require_contract and project is not None and project in repos and _approved_task(project) is None:
+            lexical, resolved = core.repo_relative(project, target)
             if lexical is None and resolved is None:
                 return None
-            if task and state_name == "draft" and lexical == f"{core.CONTRACT_DIRNAME}/{task}/contract.json":
+            draft = _active_task(project)
+            if draft and lexical == f"{core.CONTRACT_DIRNAME}/{draft}/contract.json":
                 return None
             return _deny("done-contract: 이 저장소는 승인된 계약 없이는 파일을 바꿀 수 없다(require-contract). "
                          "`done-contract init`으로 계약 초안을 쓰고 사람에게 `done-contract approve`를 부탁하라.")
-        if tool == "Bash":
-            return _bash_policy_without_contract(str(inp.get("command") or ""))
-        return None
-    protected = contract.get("protected", [])
-    allow = bool(contract.get("allow_protected_changes"))
-    if tool in EDIT_TOOLS:
-        target = _edit_target(payload, repo)
-        if target is None:
-            return None
-        lexical, resolved = target
-        if lexical is None and resolved is None:
-            return None
-        if lexical == f"{core.CONTRACT_DIRNAME}/{task}/contract.json":
-            return _deny(f"done-contract: 승인된 계약 '{task}'은 변경할 수 없다. 기준을 바꾸려면 사람에게 새 revision 승인을 요청하라.")
-        if (lexical or "").startswith(f"{core.CONTRACT_DIRNAME}/") or (resolved or "").startswith(f"{core.CONTRACT_DIRNAME}/"):
-            return _deny("done-contract: 증빙·상태 파일은 도구 명령(mark, pause, check)으로만 바꾼다.")
-        hit = None if allow else _protected_hit(lexical, resolved, protected)
-        if hit:
-            return _deny(f"done-contract: '{hit}'은 계약 '{task}'의 보호 경로다. 테스트 대신 테스트 대상 코드를 고쳐라. "
-                         "테스트 변경이 작업에 포함되면 사람에게 allow_protected_changes 재승인을 요청하라.")
         return None
     if tool == "Bash":
         cmd = str(inp.get("command") or "")
         if APPROVE_RE.search(cmd):
             return _deny("done-contract: 에이전트는 계약을 승인하거나 done-contract 승인 상태를 만질 수 없다. 사람에게 `done-contract approve`를 부탁하라.")
-        if STATE_PATH_RE.search(cmd) and (WRITE_HINT_RE.search(cmd) or HEREDOC_RE.search(cmd)):
-            return _deny("done-contract: .done-contract 상태 파일은 도구 명령(mark, pause, check)으로만 바꾼다.")
-        if not allow and (WRITE_HINT_RE.search(cmd) or HEREDOC_RE.search(cmd)):
-            try:
-                tokens = shlex.split(cmd, posix=True)
-            except ValueError:
-                tokens = cmd.split()
-            cwd = _payload_cwd(payload, repo)
-            for tok in tokens:
-                t = tok.strip("'\"")
-                if not t or t.startswith("-"):
-                    continue
-                lexical, resolved = core.repo_relative(repo, t, cwd) if ("/" in t or t.startswith(".")) or os.path.exists(cwd / t) else (core.normalize_rel(t), None)
-                hit = _protected_hit(lexical, resolved, protected)
-                if hit:
-                    return _ask(f"done-contract: 이 명령은 보호 경로 '{hit}'를 바꿀 수 있다(계약 '{task}'). 허용할지 사람이 정한다.")
+        for repo in _candidate_repos(payload):
+            task = _approved_task(repo)
+            if task:
+                decision = _bash_decision(repo, task, cmd, cwd)
+                if decision:
+                    return decision
+        if require_contract and project is not None and _approved_task(project) is None:
+            return _bash_policy_without_contract(cmd)
         return None
     return None
 
