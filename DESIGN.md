@@ -99,6 +99,16 @@ v1.0은 Codex(gpt-6-astra/high) 설계 검토에서 FAIL(결함 9건), v1.1 구�
 
 시간 예산: `check --budget s`와 Stop hook(기본 840초, `DONE_CONTRACT_STOP_BUDGET`)은 deadline을 잡고 각 명령의 timeout을 `min(항목 timeout, 남은 예산)`으로 자른다. 예산 때문에 잘린 명령과 시작하지 못한 항목은 FAIL이 아니라 ERROR다.
 
+## 6.5 어느 저장소를 판정하나 (v0.4.3)
+
+에이전트의 셸은 `cd`로 저장소 밖에 나갈 수 있다. 그래서 hook은 셸 cwd 하나에 기대지 않는다.
+
+- **프로젝트 저장소**: `hook install`이 hook 명령에 `--project <저장소>`를 적어 둔다. 없으면 Claude Code가 주는 `CLAUDE_PROJECT_DIR`, 그것도 없으면 셸 cwd.
+- **Stop**: 프로젝트 저장소와 셸 cwd의 저장소, 그리고 명령에서 `cd`한 저장소까지 활성 계약이 있으면 모두 판정한다. 하나라도 차단이면 차단. 시간 예산은 하나를 나눠 쓰고, 한 저장소의 내부 오류는 그 저장소만 "검증되지 않음"으로 표시하고 다른 저장소의 차단을 지우지 않는다.
+- **Edit류**: 편집 대상 파일을 소유한 저장소로 판정한다. 적힌 경로 그대로의 소유자(가장 가까운 `.git`, 심볼릭 링크 항목은 링크가 있는 저장소 소유)와 링크를 따라간 실제 경로의 소유자를 둘 다 본다.
+- **Bash**: 프로젝트·cwd·명령 안 `cd` 대상 저장소의 승인 계약으로 판정한다. 경로 토큰은 cwd와 각 `cd` 대상 기준으로 풀고, 적힌 경로와 실제 경로를 각각 보호·ignore 판정한다. 디렉터리 토큰은 그 아래 추적 파일 중 보호 경로가 있으면 걸린다. git-ignored 산출물(`tests/__pycache__` 등)은 보호 변경이 아니다.
+- **require-contract**: 프로젝트 저장소에만 적용한다. Bash는 명령이 프로젝트 안에서 돌거나, 프로젝트로 `cd`하거나, 프로젝트 경로를 적을 때만 정책을 적용한다.
+
 ## 7. Stop hook
 
 1. `cwd`의 git 최상위에서 `.done-contract/active`를 찾는다. 없으면 exit 0(`--require-contract`면 안내 systemMessage).
@@ -203,5 +213,20 @@ HMAC의 보장: 증빙 파일의 손 편집·손상을 감지한다. 키는 사�
 | 자가 검사(독립 판정) | `close`·`verify`는 캐시 없는 fresh index로 다시 계산해 캐시와 대조한다. 어긋나면 로그(`index_cache_mismatch`)를 남기고 캐시를 버리고 fresh 값을 쓴다. 매 Stop에는 하지 않는다(대형 repo에서 10~20초) |
 
 측정: 캐시 키 계산(ignored .gitignore 열거 포함)은 muster(12 GB, node_modules 포함)에서 0.6초.
+
+### 실제 세션 시험(2026-10-06)과 v0.4.3 검토
+
+| 결함 | 반영 |
+|---|---|
+| 시험 T5: 에이전트가 `cd ..`하자 hook이 상위 저장소를 기준으로 판정(편집 오거부, 기본 설치에선 Stop 게이트 누락 가능) | §6.5의 저장소 판정 |
+| 시험 T3: `rm -rf tests/__pycache__`가 보호 변경으로 걸림 | git-ignored 경로 제외 |
+| F1 심볼릭 링크 디렉터리·끊긴 링크가 다른 저장소로 판정돼 Edit 보호 해제 | 어휘 소유 저장소 + 실제 경로 소유 저장소 둘 다 판정 |
+| F2 ignore된 별칭이 추적 중인 테스트를 가림 | 적힌 경로·실제 경로를 각각 보호·ignore 판정 |
+| F3 한 저장소의 오류가 다른 저장소의 차단을 지움 | 저장소별 예외 격리 |
+| F4 require-contract가 다른 승인 저장소의 Bash까지 거부 | 정책은 프로젝트를 건드리는 명령에만 |
+| 잔여: `CLAUDE_PROJECT_DIR` 없는 호스트 | `hook install`이 `--project` 고정 |
+| 잔여: 명령 안 `cd A && rm tests/x` | `cd` 대상 추적 |
+| 잔여: `rm -rf tests/` 디렉터리 토큰 | 그 아래 추적 파일 대조 |
+| 잔여: 저장소마다 예산 새로 받음 | Stop 전체가 예산 하나 공유 |
 
 미해결: systemMessage가 대화형 화면에 보이는지(headless에서는 관측 불가). 셸 명령의 쓰기 판정은 원리적으로 불완전하다(§8). check 로그 실패는 CLI에는 표시하지 않는다(질문 1, 범위 밖으로 둠). git 작업 트리 해시는 ignored 파일·symlink 대상·submodule 내부·저장소 밖 입력을 포함하지 않으므로 그런 입력에 의존하는 항목에는 watch를 쓰지 않는다. 영속 index와 fresh index의 동등성은 git의 stat 기반 변경 감지에 의존하며, close·verify의 자가 검사가 그 가정이 깨진 경우를 잡는 마지막 장치다.

@@ -943,6 +943,117 @@ class TestReviewV04(Base):
         self.assertIn("FAIL(exit 3)", text)
 
 
+class TestReviewV043(Base):
+    """Regressions for the v0.4.3 review (F1-F4) and the residual cases it listed."""
+
+    def second_repo(self, name="b"):
+        b = Path(self.tmp.name) / name
+        b.mkdir()
+        git(b, "init", "-q", "-b", "main")
+        git(b, "config", "user.email", "t@example.com")
+        git(b, "config", "user.name", "t")
+        (b / "src").mkdir()
+        (b / "src" / "app.py").write_text("x\n")
+        git(b, "add", "-A")
+        git(b, "commit", "-q", "-m", "init")
+        return b.resolve()
+
+    def approved(self, **kw):
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f README.md"}], **kw)
+        self.approve(dry_run=False, accept_dirty=True)
+
+    def edit(self, fp, cwd=None, **kw):
+        out = hooks.pretool({"session_id": "s", "cwd": str(cwd or self.repo), "tool_name": "Edit", "tool_input": {"file_path": str(fp)}}, **kw)
+        return out["hookSpecificOutput"]["permissionDecision"] if out else None
+
+    def bash(self, cmd, cwd=None, **kw):
+        out = hooks.pretool({"session_id": "s", "cwd": str(cwd or self.repo), "tool_name": "Bash", "tool_input": {"command": cmd}}, **kw)
+        return out["hookSpecificOutput"]["permissionDecision"] if out else None
+
+    def test_f1_symlinked_dir_and_dangling_link_keep_their_own_repo(self):
+        b = self.second_repo()
+        (self.repo / "tests" / "link").symlink_to(b / "src")
+        (self.repo / "tests" / "dangling.py").symlink_to(b / "src" / "not-created.py")
+        self.approved()
+        os.environ["CLAUDE_PROJECT_DIR"] = str(self.repo)
+        self.assertEqual(self.edit(self.repo / "tests" / "link" / "app.py"), "deny")
+        self.assertEqual(self.edit(self.repo / "tests" / "dangling.py"), "deny")
+        (self.repo / "vendor").symlink_to(b)  # a link to another repository's top
+        self.assertIsNone(self.edit(self.repo / "vendor" / "src" / "app.py"))  # not a protected path of A
+
+    def test_f2_ignored_alias_never_hides_a_tracked_test(self):
+        (self.repo / ".gitignore").write_text("tests/ignored-link.py\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "ignore")
+        (self.repo / "tests" / "ignored-link.py").symlink_to(self.repo / "tests" / "test_a.py")
+        self.approved()
+        self.assertEqual(self.bash("echo changed > tests/ignored-link.py"), "ask")
+
+    def test_f3_an_error_in_one_repository_keeps_another_repositorys_block(self):
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f missing.md"}])
+        self.approve(dry_run=False)
+        b = self.second_repo()
+        core.init_contract(b, "broken", "x")
+        (core.task_dir(b, "broken") / "contract.json").write_text("{broken")
+        os.environ["CLAUDE_PROJECT_DIR"] = str(self.repo)
+        code, out = hooks.run_hook("stop", json.dumps({"session_id": "s", "cwd": str(b), "stop_hook_active": False}))
+        res = json.loads(out)
+        self.assertEqual(res["decision"], "block")
+        self.assertIn("done-contract ERROR", res["reason"])
+        os.environ["CLAUDE_PROJECT_DIR"] = str(b)  # other order: broken project, failing cwd repo
+        code, out = hooks.run_hook("stop", json.dumps({"session_id": "s2", "cwd": str(self.repo), "stop_hook_active": False}))
+        self.assertEqual(json.loads(out)["decision"], "block")
+
+    def test_f4_project_policy_does_not_reach_another_approved_repo(self):
+        project = self.second_repo("project")
+        self.approved()  # self.repo is another repository with an approved contract
+        os.environ["CLAUDE_PROJECT_DIR"] = str(project)
+        self.assertIsNone(self.bash("touch src/app.py", cwd=self.repo, require_contract=True))
+        self.assertEqual(self.bash(f"touch {project}/src/new.py", cwd=self.repo, require_contract=True), "deny")
+        self.assertEqual(self.bash(f"cd {project} && touch x.py", cwd=self.repo, require_contract=True), "deny")
+        self.assertEqual(self.bash("touch x.py", cwd=project, require_contract=True), "deny")
+
+    def test_residual_cd_inside_a_command_is_followed(self):
+        self.approved()
+        b = self.second_repo()
+        os.environ["CLAUDE_PROJECT_DIR"] = str(self.repo)
+        self.assertEqual(self.bash(f"cd {self.repo} && rm tests/test_a.py", cwd=b), "ask")
+
+    def test_residual_directory_token_covers_tracked_files_below(self):
+        self.approved()
+        self.assertEqual(self.bash("rm -rf tests/"), "ask")
+        self.assertEqual(self.bash("rm -rf tests"), "ask")
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "a.py").write_text("x\n")
+        self.assertIsNone(self.bash("rm -rf src"))
+
+    def test_residual_installed_project_path_works_without_env(self):
+        self.make_contract([{"id": "Q1", "text": "a", "check": "test -f missing.md"}])
+        self.approve(dry_run=False)
+        b = self.second_repo()
+        code, out = hooks.run_hook("stop", json.dumps({"session_id": "s", "cwd": str(b), "stop_hook_active": False}), project=str(self.repo))
+        self.assertEqual(json.loads(out)["decision"], "block")
+        snippet = hook_snippet("/x/done-contract", project="/a b/repo")
+        self.assertIn("--project '/a b/repo'", snippet["hooks"]["Stop"][0]["hooks"][0]["command"])
+
+    def test_one_budget_for_all_repositories(self):
+        self.make_contract([{"id": "Q1", "text": "a", "check": "sleep 2", "timeout": 10}])
+        self.approve(dry_run=False)
+        b = self.second_repo()
+        c = core.init_contract(b, "t2", "x")
+        c["items"] = [{"id": "Q1", "text": "b", "check": "sleep 2", "timeout": 10}]
+        core.write_json(core.task_dir(b, "t2") / "contract.json", c)
+        os.environ["DONE_CONTRACT_APPROVE_NO_TTY"] = "1"
+        core.approve_contract(b, "t2", stdout=io.StringIO(), dry_run=False)
+        os.environ["CLAUDE_PROJECT_DIR"] = str(self.repo)
+        os.environ["DONE_CONTRACT_STOP_BUDGET"] = "2.5"
+        started = time.monotonic()
+        out = hooks.stop({"session_id": "s", "cwd": str(b), "stop_hook_active": False})
+        self.assertLess(time.monotonic() - started, 4.0)  # not 2 x 2.5 s
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("ERROR", out["reason"])
+
+
 class TestCwdIndependence(Base):
     """Live test T5: the agent `cd`ed out of the repository and the hooks judged the wrong one."""
 

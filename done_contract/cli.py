@@ -146,8 +146,8 @@ def cmd_verify(args) -> int:
     return 0 if result["ok"] else 1
 
 
-def hook_snippet(bin_path: str, require_contract: bool = False) -> dict:
-    flag = " --require-contract" if require_contract else ""
+def hook_snippet(bin_path: str, require_contract: bool = False, project: str | None = None) -> dict:
+    flag = (" --require-contract" if require_contract else "") + (f" --project {core.shell_quote(project)}" if project else "")
     quoted = core.shell_quote(bin_path)
     return {
         "hooks": {
@@ -187,18 +187,18 @@ def merge_hooks(settings: dict, snippet: dict) -> dict:
 
 def cmd_hook(args) -> int:
     if args.hook_cmd in ("stop", "pretool"):
-        code, out = hooks.run_hook(args.hook_cmd, sys.stdin.read(), require_contract=args.require_contract)
+        code, out = hooks.run_hook(args.hook_cmd, sys.stdin.read(), require_contract=args.require_contract, project=args.project)
         if out:
             sys.stdout.write(out + "\n")
         return code
     if args.hook_cmd == "install":
         bin_path = str(Path(sys.argv[0]).resolve())
-        snippet = hook_snippet(bin_path, require_contract=args.require_contract)
+        repo = _repo(args)
+        snippet = hook_snippet(bin_path, require_contract=args.require_contract, project=str(repo))
         if not args.write:
             print(json.dumps(snippet, ensure_ascii=False, indent=2))
             print("# add to <repo>/.claude/settings.json, or run with --write to merge", file=sys.stderr)
             return 0
-        repo = _repo(args)
         settings_path = repo / ".claude" / "settings.json"
         settings = core.read_json(settings_path, default={}) or {}
         merge_hooks(settings, snippet)
@@ -279,6 +279,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--require-contract", action="store_true",
                    help="policy: deny file changes unless an approved contract is active (also used by install)")
     s.add_argument("--write", action="store_true", help="install: merge into <repo>/.claude/settings.json")
+    s.add_argument("--project", help="repository the hooks belong to (written by install; overrides CLAUDE_PROJECT_DIR and the shell cwd)")
     s.set_defaults(func=cmd_hook)
 
     s = sub.add_parser("version")

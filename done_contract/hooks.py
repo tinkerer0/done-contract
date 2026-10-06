@@ -16,6 +16,7 @@ import os
 import re
 import shlex
 import subprocess
+import time
 from pathlib import Path
 
 from . import core
@@ -94,11 +95,31 @@ def _payload_cwd(payload: dict) -> Path:
 
 
 def _project_repo(payload: dict) -> Path | None:
-    """The repository the hooks were installed for. Claude Code gives hooks CLAUDE_PROJECT_DIR,
-    which stays fixed when the agent `cd`s elsewhere; the payload cwd follows the shell."""
-    project = os.environ.get("CLAUDE_PROJECT_DIR")
-    repo = _repo_of(project) if project else None
-    return repo or _repo_of(_payload_cwd(payload))
+    """The repository the hooks were installed for: the --project path written by
+    `hook install`, else Claude Code's CLAUDE_PROJECT_DIR, else the shell cwd. The first two
+    stay fixed when the agent `cd`s elsewhere; the payload cwd follows the shell."""
+    for candidate in (payload.get("__project__"), os.environ.get("CLAUDE_PROJECT_DIR")):
+        if candidate:
+            repo = _repo_of(candidate)
+            if repo is not None:
+                return repo
+    return _repo_of(_payload_cwd(payload))
+
+
+def _lexical_repo(path: Path) -> Path | None:
+    """Repository that owns the path as written. Walks up to the nearest directory holding
+    .git, but never trusts a .git seen through a symlinked component: a symlink entry (also a
+    dangling one) belongs to the repository that contains the link itself."""
+    a = Path(os.path.normpath(str(path)))
+    while True:
+        if not a.is_symlink() and a.is_dir() and (a / ".git").exists():
+            try:
+                return core.repo_root(a)
+            except core.GitError:
+                return None
+        if a.parent == a:
+            return None
+        a = a.parent
 
 
 def _candidate_repos(payload: dict) -> list[Path]:
@@ -190,22 +211,31 @@ def _with_log_note(message: str, logged: bool) -> str:
 
 
 def stop(payload: dict, *, require_contract: bool = False) -> dict | None:
-    """Gate every repository this session is working in: the project the hooks belong to
-    (CLAUDE_PROJECT_DIR) and the shell's current repository, so a `cd` cannot skip the gate."""
+    """Gate every repository this session is working in: the project the hooks belong to and
+    the shell's current repository, so a `cd` cannot skip the gate. One time budget covers all
+    of them, and a failure in one repository never cancels another repository's block."""
     repos = _candidate_repos(payload)
     if not repos:
         return None
     session = str(payload.get("session_id") or "unknown")
-    results = []
+    deadline = time.monotonic() + _budget()
+    results: list[dict] = []
+    errors: list[str] = []
     any_active = False
     for repo in repos:
-        task = _active_task(repo)
-        if task is None:
-            continue
-        any_active = True
-        res = _stop_one(repo, task, session, require_contract)
-        if res:
-            results.append(res)
+        try:
+            task = _active_task(repo)
+            if task is None:
+                continue
+            any_active = True
+            res = _stop_one(repo, task, session, require_contract, max(0.0, deadline - time.monotonic()))
+            if res:
+                results.append(res)
+        except Exception as exc:  # isolate: keep the other repositories' decisions
+            any_active = True
+            logged = core.log_event({"event": "hook_stop_error", "repo": str(repo), "error": repr(exc)[:500]})
+            errors.append(f"done-contract ERROR ({repo.name}): 완료 검증을 수행하지 못했다 ({type(exc).__name__}: {str(exc)[:200]}). "
+                          "이 저장소의 종료는 검증되지 않았다." + ("" if logged else " (로그 기록도 실패)"))
     if not any_active:
         if require_contract:
             return {"systemMessage": "done-contract: 이 저장소는 계약이 필요하다(require-contract). 승인된 계약이 없으면 파일 변경이 거부된다. "
@@ -213,12 +243,12 @@ def stop(payload: dict, *, require_contract: bool = False) -> dict | None:
         return None
     blocking = [r for r in results if r.get("decision") == "block"]
     if blocking:
-        return {"decision": "block", "reason": "\n\n".join(r["reason"] for r in blocking)}
-    messages = [r["systemMessage"] for r in results if r.get("systemMessage")]
+        return {"decision": "block", "reason": "\n\n".join([r["reason"] for r in blocking] + errors)}
+    messages = [r["systemMessage"] for r in results if r.get("systemMessage")] + errors
     return {"systemMessage": "\n".join(messages)} if messages else None
 
 
-def _stop_one(repo: Path, task: str, session: str, require_contract: bool) -> dict | None:
+def _stop_one(repo: Path, task: str, session: str, require_contract: bool, budget_s: float) -> dict | None:
     contract = core.load_contract(repo, task)
     state_name = core.contract_state(repo, task)
     if state_name in ("closed", "abandoned"):
@@ -232,7 +262,7 @@ def _stop_one(repo: Path, task: str, session: str, require_contract: bool) -> di
     key = f"{session}__{task}__{core.contract_sha(contract)[:16]}"
     state = _load_state(key)
     try:
-        ev = core.run_check(repo, task, reuse=True, session=session, budget_s=_budget())
+        ev = core.run_check(repo, task, reuse=True, session=session, budget_s=budget_s)
     except core.LockBusy as exc:
         # same block budget as any other non-passing outcome; past the cap, release visibly as unverified
         if state["blocks"] >= max_blocks:
@@ -340,7 +370,58 @@ def _edit_decision(repo: Path, task: str, target: Path) -> dict | None:
     return None
 
 
-def _bash_decision(repo: Path, task: str, cmd: str, cwd: Path) -> dict | None:
+CD_RE = re.compile(r"^\s*(?:cd|pushd)\s+(\S+)")
+
+
+def _command_bases(cmd: str, cwd: Path) -> list[Path]:
+    """The shell cwd plus every directory the command `cd`s into (best effort, in order)."""
+    bases = [cwd]
+    current = cwd
+    for seg in SEGMENT_SPLIT_RE.split(cmd):
+        m = CD_RE.match(_strip_env_prefix(seg))
+        if m:
+            arg = os.path.expanduser(m.group(1).strip("'\""))
+            current = Path(os.path.normpath(str(Path(arg) if os.path.isabs(arg) else current / arg)))
+            bases.append(current)
+    return bases
+
+
+def _command_paths(repo: Path, cmd: str, bases: list[Path]) -> list[tuple[str | None, str | None]]:
+    """(lexical, resolved) repo-relative paths named by the command's tokens, for every base."""
+    try:
+        tokens = shlex.split(cmd, posix=True)
+    except ValueError:
+        tokens = cmd.split()
+    inside = [b for b in bases if core.repo_relative(repo, b)[0] is not None]
+    out: list[tuple[str | None, str | None]] = []
+    for tok in tokens:
+        t = tok.strip("'\"")
+        if not t or t.startswith("-"):
+            continue
+        if os.path.isabs(t) or t.startswith("~"):
+            out.append(core.repo_relative(repo, os.path.expanduser(t)))
+            continue
+        pathlike = "/" in t or t.startswith(".")
+        for base in bases:
+            if pathlike or os.path.lexists(base / t):
+                out.append(core.repo_relative(repo, t, base))
+        if not pathlike and inside:
+            out.append((core.normalize_rel(t), None))
+    return out
+
+
+def _protected_under_dir(repo: Path, rel: str, protected: list[str]) -> str | None:
+    if not (repo / rel).is_dir():
+        return None
+    listing = subprocess.run(["git", "ls-files", "-z", "--", rel], cwd=str(repo), capture_output=True).stdout
+    for raw in listing.split(b"\0"):
+        f = raw.decode("utf-8", "replace")
+        if f and core.matches_any(f, protected):
+            return f
+    return None
+
+
+def _bash_decision(repo: Path, task: str, cmd: str, bases: list[Path]) -> dict | None:
     contract = core.load_contract(repo, task)
     protected = contract.get("protected", [])
     allow = bool(contract.get("allow_protected_changes"))
@@ -348,31 +429,27 @@ def _bash_decision(repo: Path, task: str, cmd: str, cwd: Path) -> dict | None:
         return _deny("done-contract: .done-contract 상태 파일은 도구 명령(mark, pause, check)으로만 바꾼다.")
     if allow or not (WRITE_HINT_RE.search(cmd) or HEREDOC_RE.search(cmd)):
         return None
-    try:
-        tokens = shlex.split(cmd, posix=True)
-    except ValueError:
-        tokens = cmd.split()
-    cwd_inside = core.repo_relative(repo, cwd)[0] is not None
-    for tok in tokens:
-        t = tok.strip("'\"")
-        if not t or t.startswith("-"):
-            continue
-        if "/" in t or t.startswith(".") or os.path.exists(cwd / t):
-            lexical, resolved = core.repo_relative(repo, t, cwd)
-        elif cwd_inside:
-            lexical, resolved = core.normalize_rel(t), None
-        else:
-            continue
-        hit = _protected_hit(lexical, resolved, protected)
-        if hit and not _is_ignored(repo, hit):  # ignored build output under tests/ (e.g. __pycache__) is not a test change
-            return _ask(f"done-contract: 이 명령은 보호 경로 '{hit}'를 바꿀 수 있다(계약 '{task}'). 허용할지 사람이 정한다.")
+    for lexical, resolved in _command_paths(repo, cmd, bases):
+        for rel in (lexical, resolved):  # each spelling on its own: an ignored alias never hides a tracked target
+            if not rel or rel == ".":
+                continue
+            hit = rel if core.matches_any(rel, protected) else _protected_under_dir(repo, rel, protected)
+            if hit and not _is_ignored(repo, hit):  # ignored build output under tests/ (e.g. __pycache__) is not a test change
+                return _ask(f"done-contract: 이 명령은 보호 경로 '{hit}'를 바꿀 수 있다(계약 '{task}'). 허용할지 사람이 정한다.")
     return None
 
 
+def _touches_repo(repo: Path, cmd: str, bases: list[Path]) -> bool:
+    """Whether a shell command may act on the repository: it runs or `cd`s inside it, or names one of its paths."""
+    if any(core.repo_relative(repo, b)[0] is not None for b in bases):
+        return True
+    return any(lexical or resolved for lexical, resolved in _command_paths(repo, cmd, bases))
+
+
 def pretool(payload: dict, *, require_contract: bool = False) -> dict | None:
-    """Edits are judged by the repository that contains the edited file; shell commands by the
-    project repository and the shell's current repository. The require-contract policy covers
-    the project repository (where the hooks are installed)."""
+    """Edits are judged by the repositories that own the edited file (as written and as resolved);
+    shell commands by the project repository and the shell's current repository. The
+    require-contract policy covers the project repository (where the hooks are installed)."""
     tool = payload.get("tool_name")
     inp = payload.get("tool_input") or {}
     cwd = _payload_cwd(payload)
@@ -384,7 +461,7 @@ def pretool(payload: dict, *, require_contract: bool = False) -> dict | None:
         target = Path(fp) if Path(fp).is_absolute() else cwd / fp
         target = Path(os.path.normpath(str(target)))
         repos: list[Path] = []
-        for r in (_repo_of(target), _repo_of(target.resolve())):
+        for r in (_lexical_repo(target), _repo_of(target.resolve())):
             if r is not None and r not in repos:
                 repos.append(r)
         for repo in repos:
@@ -407,19 +484,25 @@ def pretool(payload: dict, *, require_contract: bool = False) -> dict | None:
         cmd = str(inp.get("command") or "")
         if APPROVE_RE.search(cmd):
             return _deny("done-contract: 에이전트는 계약을 승인하거나 done-contract 승인 상태를 만질 수 없다. 사람에게 `done-contract approve`를 부탁하라.")
-        for repo in _candidate_repos(payload):
+        bases = _command_bases(cmd, cwd)
+        repos: list[Path] = []
+        for r in _candidate_repos(payload) + [_repo_of(b) for b in bases[1:]]:
+            if r is not None and r not in repos:
+                repos.append(r)
+        for repo in repos:
             task = _approved_task(repo)
             if task:
-                decision = _bash_decision(repo, task, cmd, cwd)
+                decision = _bash_decision(repo, task, cmd, bases)
                 if decision:
                     return decision
-        if require_contract and project is not None and _approved_task(project) is None:
+        if (require_contract and project is not None and _approved_task(project) is None
+                and _touches_repo(project, cmd, bases)):
             return _bash_policy_without_contract(cmd)
         return None
     return None
 
 
-def run_hook(kind: str, stdin_text: str, *, require_contract: bool = False) -> tuple[int, str]:
+def run_hook(kind: str, stdin_text: str, *, require_contract: bool = False, project: str | None = None) -> tuple[int, str]:
     """Returns (exit_code, stdout). Always exit 0; decisions ride in the JSON.
 
     On an internal error the stop hook allows the stop but says so loudly, and
@@ -430,6 +513,8 @@ def run_hook(kind: str, stdin_text: str, *, require_contract: bool = False) -> t
             payload = {}
     except json.JSONDecodeError:
         payload = {}
+    if project:
+        payload["__project__"] = project
     try:
         if kind == "stop":
             result = stop(payload, require_contract=require_contract)
