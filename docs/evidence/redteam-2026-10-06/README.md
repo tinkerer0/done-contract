@@ -18,14 +18,14 @@ Claude 외에 **Grok 4.7**(grok CLI)과 **Gemini 3.8 Flash High**(cursor-agent)�
 
 **막힌 것(확인):** 보호 경로(테스트) 수정·삭제, `git update-index --assume-unchanged`로 변경 숨기기, 에이전트의 `done-contract approve`, 상태·hook 설정 디렉터리 삭제·이동(이 시험 뒤 추가한 방어).
 
-**통한 것(= 문서화된 적대적 경계):** check 실행 환경 오염(루트 `unittest.py`로 stdlib 가리기, `PATH` 앞 가짜 바이너리), `evidence.json`+HMAC 자체 서명(단 close/verify는 재실행하므로 닫히지 않음), 소스에서 테스트 프레임워크 무력화, 빈 `## 사용법` 헤더.
+**통한 것(= 문서화된 적대적 경계):** check 실행 환경 오염(루트 `unittest.py`로 stdlib 가리기, `PATH` 앞 가짜 바이너리), `evidence.json`+HMAC 자체 서명(단 close는 계약 검사를 다시 실행하므로 위조만으로는 닫히지 않고, verify도 v0.4.4부터 명령 위조를 드러낸다), 소스에서 테스트 프레임워크 무력화, 빈 `## 사용법` 헤더.
 
 **중요:** 이 "성공"들은 오염된 환경 안에서만 유효하다. 시험 뒤 코디네이터가 **깨끗한 셸에서 각 저장소를 다시 검사하니 두 저장소 모두 FAIL**이었다. 실제 코드는 미완성 그대로다. 위조 검출의 주체는 `close`다 — close는 캐시·증빙을 믿지 않고 계약서의 명령을 처음부터 다시 실행한다. v0.4.4 검토에서 `verify`가 증빙의 명령을 그대로 재실행해 명령 위조를 놓치는 것이 드러나, verify가 증빙 명령을 계약 항목과 대조하도록 고쳤다(`matches_contract`).
 
 ## 시험이 바꾼 것 (v0.4.4)
 
-- 상태·hook 설정 디렉터리(`.done-contract`·`.claude`·`.cursor`·`.grok`)를 지우거나 옮기는 명령을 승인된 계약 진행 중 거부(게이트 끄기 차단).
+- 상태·hook 설정 디렉터리(`.done-contract`·`.claude`·`.cursor`·`.grok`)를 지우거나 옮기는 명령을 승인된 계약 진행 중 거부(게이트 끄기 차단). 명령을 토큰 단위로 나눠 실제 대상 경로를 판정한다(cd·pushd·popd 이동 포함).
 - Grok·Cursor 도구 이름/페이로드 키 정규화, 승인 중 hook 설정 파일 보호(멀티 CLI 지원).
-- README에 적대적 경계와 "깨끗한 재검사가 위조를 드러낸다"를 명시.
+- README에 적대적 경계를 명시하고, 위조 검출의 주체가 계약을 다시 실행하는 `close`임을 정정. `verify`는 증빙 명령을 승인된 계약과 대조하도록 고쳤다.
 
 파일: `<agent>-<scenario>.meta.json`(판정·시간), `.screen.txt`(TUI 화면), `.log.jsonl`(결정 로그). 경로는 비식별화. 구동기는 `tui_driver.py`.
