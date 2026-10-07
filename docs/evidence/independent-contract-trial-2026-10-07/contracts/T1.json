@@ -1,0 +1,46 @@
+{
+  "items": [
+    {
+      "id": "Q1",
+      "text": "drawing.ts에서 strokesBounds(strokes)를 호출할 수 있다.",
+      "check": "node --input-type=module -e 'import assert from \"node:assert/strict\";\nimport {registerHooks} from \"node:module\";registerHooks({resolve(s,c,next){try{return next(s,c);}catch(e){if((s.startsWith(\"./\")||s.startsWith(\"../\"))&&e.code===\"ERR_MODULE_NOT_FOUND\"){for(const v of [s+\".ts\",s.replace(/\\.js$/,\".ts\"),s+\"/index.ts\"]){try{return next(v,c);}catch{}}}throw e;}}});\nconst m=await import(\"./src/shared/drawing.ts\");\nassert.equal(typeof m.strokesBounds,\"function\");\nconsole.log(\"PASS\");'",
+      "timeout": 120
+    },
+    {
+      "id": "Q2",
+      "text": "모든 획의 점을 감싸는 최소 사각형을 {minX,minY,maxX,maxY}로 반환한다.",
+      "check": "node --input-type=module -e 'import assert from \"node:assert/strict\";\nimport {registerHooks} from \"node:module\";registerHooks({resolve(s,c,next){try{return next(s,c);}catch(e){if((s.startsWith(\"./\")||s.startsWith(\"../\"))&&e.code===\"ERR_MODULE_NOT_FOUND\"){for(const v of [s+\".ts\",s.replace(/\\.js$/,\".ts\"),s+\"/index.ts\"]){try{return next(v,c);}catch{}}}throw e;}}});\nconst m=await import(\"./src/shared/drawing.ts\");\nfor(const points of [[{x:7,y:-3}],[{x:-8,y:6},{x:4,y:-2},{x:1,y:1}]]){const strokes=points.map(p=>({points:[p],width:0}));assert.deepEqual(m.strokesBounds(strokes),{minX:Math.min(...points.map(p=>p.x)),minY:Math.min(...points.map(p=>p.y)),maxX:Math.max(...points.map(p=>p.x)),maxY:Math.max(...points.map(p=>p.y))});}\nconsole.log(\"PASS\");'",
+      "timeout": 120
+    },
+    {
+      "id": "Q3",
+      "text": "각 획 굵기의 절반을 사방에 반영하며 생략된 굵기는 기본 굵기를 쓴다.",
+      "check": "node --input-type=module -e 'import assert from \"node:assert/strict\";\nimport {registerHooks} from \"node:module\";registerHooks({resolve(s,c,next){try{return next(s,c);}catch(e){if((s.startsWith(\"./\")||s.startsWith(\"../\"))&&e.code===\"ERR_MODULE_NOT_FOUND\"){for(const v of [s+\".ts\",s.replace(/\\.js$/,\".ts\"),s+\"/index.ts\"]){try{return next(v,c);}catch{}}}throw e;}}});\nconst m=await import(\"./src/shared/drawing.ts\");\nconst strokes=[{points:[{x:0,y:0}],width:10},{points:[{x:10,y:3}],width:2}];assert.deepEqual(m.strokesBounds(strokes),{minX:-5,minY:-5,maxX:11,maxY:5});const h=m.DEFAULT_STROKE_WIDTH/2;assert.deepEqual(m.strokesBounds([{points:[{x:2,y:3}]}]),{minX:2-h,minY:3-h,maxX:2+h,maxY:3+h});\nconsole.log(\"PASS\");'",
+      "timeout": 120
+    },
+    {
+      "id": "Q4",
+      "text": "점이 하나도 없으면 null을 반환한다.",
+      "check": "node --input-type=module -e 'import assert from \"node:assert/strict\";\nimport {registerHooks} from \"node:module\";registerHooks({resolve(s,c,next){try{return next(s,c);}catch(e){if((s.startsWith(\"./\")||s.startsWith(\"../\"))&&e.code===\"ERR_MODULE_NOT_FOUND\"){for(const v of [s+\".ts\",s.replace(/\\.js$/,\".ts\"),s+\"/index.ts\"]){try{return next(v,c);}catch{}}}throw e;}}});\nconst m=await import(\"./src/shared/drawing.ts\");\nfor(const s of [[],[{points:[]}],[{points:[],width:100},{points:[]}]])assert.equal(m.strokesBounds(s),null);\nconsole.log(\"PASS\");'",
+      "timeout": 120
+    },
+    {
+      "id": "Q5",
+      "text": "x 또는 y가 NaN 또는 ±Infinity인 점은 다른 좌표까지 통째로 무시한다.",
+      "check": "node --input-type=module -e 'import assert from \"node:assert/strict\";\nimport {registerHooks} from \"node:module\";registerHooks({resolve(s,c,next){try{return next(s,c);}catch(e){if((s.startsWith(\"./\")||s.startsWith(\"../\"))&&e.code===\"ERR_MODULE_NOT_FOUND\"){for(const v of [s+\".ts\",s.replace(/\\.js$/,\".ts\"),s+\"/index.ts\"]){try{return next(v,c);}catch{}}}throw e;}}});\nconst m=await import(\"./src/shared/drawing.ts\");\nconst bad=[];for(const n of [NaN,Infinity,-Infinity]){bad.push({x:n,y:99999},{x:-99999,y:n});}assert.equal(m.strokesBounds([{points:bad,width:10}]),null);assert.deepEqual(m.strokesBounds([{points:[...bad,{x:4,y:7}],width:2},{points:[{x:Infinity,y:0}],width:2000}]),{minX:3,minY:6,maxX:5,maxY:8});\nconsole.log(\"PASS\");'",
+      "timeout": 120
+    },
+    {
+      "id": "Q6",
+      "text": "대상 기능에 대한 테스트를 추가하고 실제 실행하여 통과한다.",
+      "check": "node --input-type=module -e 'import assert from \"node:assert/strict\";\nimport path from \"node:path\";\nimport {startVitest} from \"vitest/node\";\nconst originalNames = new Set([\"erasing > keeps strokes the eraser does not touch\", \"erasing > splits a stroke around an erased middle point\", \"erasing > removes a stroke whose every point is erased\", \"erasing > cuts a segment the eraser path crosses even when both ends survive\", \"erasing > ignores non-finite eraser input\", \"erasing > drops empty strokes\", \"geometry helpers > measures distance to a segment\", \"geometry helpers > converts legacy normalized strokes with the canvas size\", \"geometry helpers > reports the lowest drawn point plus half the line and a margin\", \"geometry helpers > keeps the stroke width on every erased piece\"]);\nfunction flatten(files){const all=[];function visit(t){if(t.type===\"test\")all.push(t);for(const c of t.tasks??[])visit(c);}files.forEach(visit);return all;}\nasync function run(plugins=[]){const ctx=await startVitest(\"test\",[],{watch:false,reporters:[{onTestRunEnd(){}}],silent:true,passWithNoTests:false},{plugins});assert.ok(ctx,\"Vitest started\");const tests=flatten(ctx.state.getFiles());const errors=ctx.state.getUnhandledErrors();await ctx.close();process.exitCode=0;return {tests,errors};}\nconst clean=await run();assert.equal(clean.errors.length,0,\"no unhandled suite errors\");assert.ok(clean.tests.length>10,\"additional executed tests required\");assert.ok(clean.tests.every(t=>t.result?.state===\"pass\"),\"all tests must run and pass (no skips/todos)\");\nconst added=new Set(clean.tests.filter(t=>!originalNames.has(t.fullTestName)).map(t=>t.fullName));assert.ok(added.size,\"a new test is required\");\nfor(const [file,name,change] of [[\"src/shared/drawing.ts\", \"strokesBounds\", \"return value===null?{minX:0,minY:0,maxX:0,maxY:0}:null;\"]]){\n const target=path.resolve(file);const virtual=\"\\0contract-probe-\"+name;\n const plugin={name:\"contract-probe-\"+name,enforce:\"pre\",async resolveId(source,importer){if(source.includes(\"contract-original\"))return;const r=await this.resolve(source,importer,{skipSelf:true});if(r?.id===target)return virtual;},load(id){if(id===virtual){const real=JSON.stringify(target+\"?contract-original\");return `export * from ${real};import * as actual from ${real};export function ${name}(...args){const value=actual[${JSON.stringify(name)}](...args);${change}}`;}}};\n const mutated=await run([plugin]);assert.equal(mutated.errors.length,0,\"mutation must not cause infrastructure errors\");assert.ok(mutated.tests.some(t=>added.has(t.fullName)&&t.result?.state===\"fail\"),\"new tests must detect wrong \"+name+\" behavior\");\n}\nconsole.log(\"PASS: added tests run and detect target behavior changes\");\n'",
+      "timeout": 120
+    }
+  ],
+  "repo_checks": [
+    "npx --no-install vitest run",
+    "npx --no-install tsc --noEmit"
+  ],
+  "allow_protected_changes": true,
+  "notes": "최소 사각형은 각 유효 점에 그 점이 속한 획 width/2를 적용한 사각형들의 합집합으로 읽었다. width 생략은 기존 DEFAULT_STROKE_WIDTH, 모든 점이 비유한이면 유효 점 없음(null)으로 읽었다. 음수/비유한 width 동작은 요청 밖이라 강제하지 않는다. 테스트 추가 검사는 원본 10개보다 많은 통과 테스트와 새 테스트의 대상 export 동작 교란 감지를 확인한다. Vitest의 메모리 내 플러그인만 쓰며 검사 파일은 만들지 않는다. 유한 사례/어휘 검사이므로 모든 가능한 의미적 동등성이나 무한 입력을 증명하지는 않는다."
+}

@@ -1,0 +1,22 @@
+{
+  "items": [
+    {
+      "id": "Q1",
+      "text": "예전 0~1 좌표를 변환할 때 각 획의 명시된 굵기를 기본값으로 잃어버리지 않는다.",
+      "check": "node --input-type=module -e 'import assert from \"node:assert/strict\";\nimport {registerHooks} from \"node:module\";registerHooks({resolve(s,c,next){try{return next(s,c);}catch(e){if((s.startsWith(\"./\")||s.startsWith(\"../\"))&&e.code===\"ERR_MODULE_NOT_FOUND\"){for(const v of [s+\".ts\",s.replace(/\\.js$/,\".ts\"),s+\"/index.ts\"]){try{return next(v,c);}catch{}}}throw e;}}});\nconst m=await import(\"./src/shared/drawing.ts\");\nconst input=[0,1.5,2.75,5,8.25].map(width=>({points:[{x:0.25,y:0.75}],width}));input.push({points:[],width:11});const out=m.convertLegacyStrokes(input,320,180);assert.equal(out.length,input.length);for(let i=0;i<input.length;i++)assert.equal(out[i].width,input[i].width);\nconsole.log(\"PASS\");'",
+      "timeout": 120
+    },
+    {
+      "id": "Q2",
+      "text": "굵기 수정 뒤에도 레거시 좌표의 캔버스 크기 변환과 기본 굵기 의미를 유지한다.",
+      "check": "node --input-type=module -e 'import assert from \"node:assert/strict\";\nimport {registerHooks} from \"node:module\";registerHooks({resolve(s,c,next){try{return next(s,c);}catch(e){if((s.startsWith(\"./\")||s.startsWith(\"../\"))&&e.code===\"ERR_MODULE_NOT_FOUND\"){for(const v of [s+\".ts\",s.replace(/\\.js$/,\".ts\"),s+\"/index.ts\"]){try{return next(v,c);}catch{}}}throw e;}}});\nconst m=await import(\"./src/shared/drawing.ts\");\nconst input=[{points:[{x:0,y:0},{x:0.25,y:0.75},{x:1,y:1}],width:5},{points:[{x:0.5,y:0.5}]}];const snapshot=structuredClone(input);const out=m.convertLegacyStrokes(input,320,180);assert.deepEqual(out[0].points,[{x:0,y:0},{x:80,y:135},{x:320,y:180}]);assert.deepEqual(out[1].points,[{x:160,y:90}]);assert.equal(out[1].width??m.DEFAULT_STROKE_WIDTH,m.DEFAULT_STROKE_WIDTH);assert.deepEqual(input,snapshot);\nconsole.log(\"PASS\");'",
+      "timeout": 120
+    }
+  ],
+  "repo_checks": [
+    "npx --no-install vitest run",
+    "npx --no-install tsc --noEmit"
+  ],
+  "allow_protected_changes": false,
+  "notes": "예전 형식 열기의 이 프로젝트 내 진입점은 convertLegacyStrokes다. 저장된 명시 굵기를 보존하는 수정으로 읽었으며 기존 좌표 변환과 입력 비변경도 회귀 검사한다. 테스트 추가 요청이 없어 protected 변경은 허용하지 않는다."
+}

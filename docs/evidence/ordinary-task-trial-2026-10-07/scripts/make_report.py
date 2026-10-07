@@ -5,7 +5,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import load_results
 HERE = Path(__file__).resolve().parent; DATA = HERE / "data"
-rows = load_results(); cls = json.load(open(DATA / "classification.json")); ARMS = ["off", "ask", "contract", "gate"]
+cls = json.load(open(DATA / "classification.json")); ARMS = ["off", "ask", "contract", "gate"]
+rows = [r for r in load_results() if r["arm"] in ARMS]   # the independent-contract arms belong to the second experiment
 TOOLS = [("claude-sonnet", "Claude Sonnet 5.5"), ("claude-haiku", "Claude Haiku 4.5"), ("grok", "Grok 4.7"), ("cursor", "Gemini 3.8 Flash (Cursor)")]
 def tool(r): return "claude-sonnet" if "sonnet" in r["name"] else "claude-haiku" if "haiku" in r["name"] else "grok" if r["name"].startswith("grok") else "cursor"
 def lab(r):

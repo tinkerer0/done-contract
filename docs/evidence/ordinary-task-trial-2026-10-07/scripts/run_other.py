@@ -5,12 +5,13 @@ Phase 2 of the two-phase arms resumes the same session. Full streams are saved u
 import argparse, concurrent.futures as cf, glob, json, os, random, shutil, subprocess, sys, time, traceback
 from pathlib import Path
 import run_trial as rt
-from run_trial import REQ, PREFIX, TWO_PHASE, PHASE2, SCR, DATA, BIN, sh, paths, now, git_lines, finalize
+from run_trial import REQ, PREFIX, TWO_PHASE, PHASE2, SCR, DATA, BIN, sh, paths, now, git_lines, finalize, install_hook, setup_independent_contract, INDEP_ARMS, HOOK_ARMS
 from common import audit2, FINGERPRINTS
 
 CURSOR_MODEL = "gemini-3.8-flash-high"
 MODEL_LABEL = {"grok": "grok-4.7", "cursor": "cursor-gemini-3.8-flash"}
 ARMS_BY_CLI = {"grok": ["off", "ask", "contract", "gate"], "cursor": ["off", "ask", "contract"]}
+ALL_GROK_ARMS = ["off", "ask", "contract", "gate", "indep-gate", "indep-info"]
 
 def synth_events(cli, ev):
     """Turn a CLI's tool events into Claude-shaped assistant tool_use events so one audit covers every CLI."""
@@ -78,13 +79,16 @@ def one(cli, task, arm, rep):
     home.mkdir()
     env = dict(os.environ, DONE_CONTRACT_HOME=str(home), PATH=f"{BIN}:{os.environ['PATH']}", GOAL_REANCHOR_DISABLED="1",
                DELEGATION_GATE_SUPPRESS="1", NOTE_REMINDER_DISABLE="1", PYTHONDONTWRITEBYTECODE="1")
+    if arm in HOOK_ARMS and os.environ.get("TRIAL_WRAP_BIN"):
+        snap = DATA / "snapshots" / name; shutil.rmtree(snap, ignore_errors=True); snap.mkdir(parents=True)
+        env.update(TRIAL_REAL_BIN=str((BIN / "done-contract").resolve()), TRIAL_RUN_DIR=str(run), TRIAL_SNAP_DIR=str(snap))
     meta = {"name": name, "task": task, "arm": arm, "model": MODEL_LABEL[cli], "cli": cli, "rep": rep, "run_dir": str(run),
             "started_at": now(), "phases": [], "gate_status": "n/a", "audit_flags": [], "block_reasons": [], "leak_fingerprints": []}
-    if arm == "gate":
-        rc, out, err = sh([str(BIN / "done-contract"), "--repo", str(run), "hook", "install", "--write"], env=env)
-        s = run / ".claude/settings.json"
-        if rc != 0 or not s.exists() or "done-contract" not in s.read_text():
-            raise RuntimeError(f"{name}: hook install failed rc={rc}: {(out + err)[-200:]}")
+    if arm in HOOK_ARMS:
+        install_hook(run, env, name)
+    if arm in INDEP_ARMS:
+        meta["contract_source"] = "independent"; meta["contract_slug"] = setup_independent_contract(run, env, task, name)
+        meta["gate_status"] = "ok" if arm == "indep-gate" else "n/a"
     st0 = git_lines(run)
     tag1 = "p1" if arm in TWO_PHASE else "p0"
     d = call(cli, PREFIX[arm] + REQ[task], run, env, name, tag=tag1)
@@ -111,10 +115,11 @@ def one(cli, task, arm, rep):
             meta["gate_status"] = "ok"
         else:
             meta["gate_status"] = "approval_failed" if not meta["approved"] else "no_session"
-    if arm == "gate" and meta["gate_status"] == "ok":
+    if arm in HOOK_ARMS and meta["gate_status"] == "ok":
+        need = 2 if arm == "gate" else 1          # the first stop of the agent-written flow is unapproved; the independent contract is approved from the start
         home_log = home / "log.jsonl"
         stops = [json.loads(l) for l in home_log.read_text().splitlines() if l.strip() and json.loads(l).get("event") == "stop"] if home_log.exists() else []
-        if len(stops) < 2: meta["gate_status"] = "hook_not_fired"       # no Stop event after the unapproved first stop
+        if len(stops) < need: meta["gate_status"] = "hook_not_fired"       # no Stop event after the unapproved first stop
     res = finalize(run, home, logs, name, task, meta, last)
     if res["check"].get("complete") is None: raise RuntimeError(f"{name}: grader failed: {str(res['check'])[:200]}")
     return res

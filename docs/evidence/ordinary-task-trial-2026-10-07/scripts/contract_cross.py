@@ -7,7 +7,7 @@ from pathlib import Path
 from common import load_results
 SCR = Path(os.environ["TRIAL_SCR"]); TOOL_BIN = os.environ["TRIAL_TOOL_BIN"]
 STRICT_ONLY = {k for k, v in json.load(open(Path(__file__).resolve().parent / "data/classification.json")).items() if v == "strict_only"}
-rows = [r for r in load_results() if "check" in r and r.get("gate_status") in ("ok", "n/a") and Path(r.get("run_dir", "")).exists()]
+rows = [r for r in load_results() if r["arm"] in ("off", "ask", "contract", "gate") and "check" in r and r.get("gate_status") in ("ok", "n/a") and Path(r.get("run_dir", "")).exists()]
 owners = [r for r in rows if r["arm"] in ("gate", "contract") and (r.get("contract") or {}).get("items")]
 
 def run_items(contract, owner_rd, state_dir):

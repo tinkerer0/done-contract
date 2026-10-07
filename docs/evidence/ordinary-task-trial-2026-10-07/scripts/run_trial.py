@@ -26,7 +26,12 @@ GATE_PREFIX = ("[작업 방식] 이 저장소는 done-contract 완료 게이트�
  "3. 이번 작업에서 새 테스트를 쓰게 되면 계약에 \"allow_protected_changes\": true를 적는다.\n"
  "4. 그다음 멈추고 사람이 `done-contract approve`로 승인하길 기다려라. 승인 전에는 코드를 바꾸지 마라.\n"
  "승인되면 작업하고, 끝내기 전에 `done-contract check`로 확인해라.\n\n[요청]\n")
-PREFIX = {"off": "", "ask": ASK_PREFIX, "contract": GATE_PREFIX, "gate": GATE_PREFIX}
+INDEP_PREFIX = ("[작업 방식] 이 저장소는 done-contract 완료 게이트를 쓴다. 승인된 계약이 이미 있다. 계약의 항목은 `done-contract status`로 볼 수 있다. "
+ "작업을 하고, 끝내기 전에 `done-contract check`로 확인해라. 계약 파일은 고치지 마라.\n\n[요청]\n")
+PREFIX = {"off": "", "ask": ASK_PREFIX, "contract": GATE_PREFIX, "gate": GATE_PREFIX, "indep-gate": INDEP_PREFIX, "indep-info": INDEP_PREFIX}
+INDEP_ARMS = ("indep-gate", "indep-info")
+HOOK_ARMS = ("gate", "indep-gate")
+CONTRACTS = TRIAL / "contracts"          # contracts written by an independent author, one per task
 TWO_PHASE = ("contract", "gate")
 PHASE2 = "계약이 승인됐다. 이제 작업을 진행해라. 끝내기 전에 `done-contract check`로 확인해라."
 ALLOWED = ["Read", "Write", "Edit", "Glob", "Grep", "Bash(npx:*)", "Bash(npm:*)", "Bash(node:*)", "Bash(ls:*)", "Bash(cat:*)", "Bash(grep:*)",
@@ -123,6 +128,40 @@ def phase_row(d):
 def git_lines(run):
     return set(sh(["git", "status", "--porcelain"], cwd=run)[1].splitlines())
 
+def install_hook(run, env, name):
+    """Install the Stop/PreToolUse hooks. When a snapshot wrapper is configured the installed commands point at it, so every Stop is recorded."""
+    rc, out, err = sh([str(BIN / "done-contract"), "--repo", str(run), "hook", "install", "--write"], env=env)
+    st = run / ".claude/settings.json"
+    if rc != 0 or not st.exists() or "done-contract" not in st.read_text():
+        raise RuntimeError(f"{name}: hook install failed rc={rc}: {(out + err)[-200:]}")
+    wrap = os.environ.get("TRIAL_WRAP_BIN")
+    if wrap:
+        real = str((BIN / "done-contract").resolve())
+        txt = st.read_text()
+        if real not in txt: raise RuntimeError(f"{name}: real tool path not found in hook settings")
+        st.write_text(txt.replace(real, str(Path(wrap) / "done-contract")))
+
+def setup_independent_contract(run, env, task, name):
+    """Create the task's contract from the independent author's file, merge it into an init'ed skeleton and approve it (the harness stands in for the person)."""
+    src = CONTRACTS / f"{task}.json"
+    if not src.exists(): raise RuntimeError(f"{name}: no independent contract for {task}")
+    slug = f"{task.lower()}-indep"
+    rc, out, err = sh([str(BIN / "done-contract"), "--repo", str(run), "init", "--task", slug, "--request", REQ[task]], env=env)
+    cp = run / ".done-contract" / slug / "contract.json"
+    if rc != 0 or not cp.exists(): raise RuntimeError(f"{name}: init failed rc={rc}: {(out + err)[-200:]}")
+    c = json.loads(cp.read_text()); a = json.loads(src.read_text())
+    items = []
+    for i, it in enumerate(a["items"], 1):
+        row = {"id": str(it.get("id") or f"Q{i}"), "text": it["text"], "check": it["check"]}
+        if it.get("timeout"): row["timeout"] = it["timeout"]
+        items.append(row)
+    c["items"] = items; c["repo_checks"] = list(a.get("repo_checks") or []); c["allow_protected_changes"] = bool(a.get("allow_protected_changes"))
+    cp.write_text(json.dumps(c, ensure_ascii=False, indent=2))
+    rc, out, err = sh([str(BIN / "done-contract"), "--repo", str(run), "approve", "--yes"], env=dict(env, DONE_CONTRACT_APPROVE_NO_TTY="1"))
+    (paths(name)[2] / f"{name}.approval0.txt").write_text(out + err)
+    if rc != 0: raise RuntimeError(f"{name}: approving the independent contract failed rc={rc}: {(out + err)[-300:]}")
+    return slug
+
 def one(task, arm, mname, rep, cli="claude"):
     name = f"{cli}-{mname}-{task}-{arm}-r{rep}"
     run, home, logs = paths(name)
@@ -133,14 +172,17 @@ def one(task, arm, mname, rep, cli="claude"):
     home.mkdir()
     env = dict(os.environ, DONE_CONTRACT_HOME=str(home), PATH=f"{BIN}:{os.environ['PATH']}", GOAL_REANCHOR_DISABLED="1",
                DELEGATION_GATE_SUPPRESS="1", NOTE_REMINDER_DISABLE="1", PYTHONDONTWRITEBYTECODE="1")
+    if arm in HOOK_ARMS and os.environ.get("TRIAL_WRAP_BIN"):
+        snap = DATA / "snapshots" / name; shutil.rmtree(snap, ignore_errors=True); snap.mkdir(parents=True)
+        env.update(TRIAL_REAL_BIN=str((BIN / "done-contract").resolve()), TRIAL_RUN_DIR=str(run), TRIAL_SNAP_DIR=str(snap))
     model = MODELS[mname]
     meta = {"name": name, "task": task, "arm": arm, "model": model, "cli": cli, "rep": rep, "run_dir": str(run),
             "started_at": now(), "phases": [], "gate_status": "n/a", "audit_flags": [], "block_reasons": []}
-    if arm == "gate":
-        rc, out, err = sh([str(BIN / "done-contract"), "--repo", str(run), "hook", "install", "--write"], env=env)
-        settings = run / ".claude/settings.json"
-        if rc != 0 or not settings.exists() or "done-contract" not in settings.read_text():
-            raise RuntimeError(f"{name}: hook install failed rc={rc}: {(out + err)[-200:]}")
+    if arm in HOOK_ARMS:
+        install_hook(run, env, name)
+    if arm in INDEP_ARMS:
+        meta["contract_source"] = "independent"; meta["contract_slug"] = setup_independent_contract(run, env, task, name)
+        meta["gate_status"] = "ok" if arm == "indep-gate" else "n/a"
     st0 = git_lines(run)
     prompt = PREFIX[arm] + REQ[task]
     tag1 = "p1" if arm in TWO_PHASE else "p0"
@@ -185,7 +227,7 @@ def finalize(run, home, logs, name, task, meta, last):
     stops = [e for e in ev if e.get("event") == "stop"]
     meta["stop_events"] = [{k: e.get(k) for k in ("decision", "verdict", "blocks")} for e in stops]
     meta["blocks"] = sum(1 for e in stops if e.get("decision") == "block")
-    if meta.get("arm") == "gate" and meta.get("gate_status") == "ok" and not stops:
+    if meta.get("arm") in HOOK_ARMS and meta.get("gate_status") == "ok" and not stops:
         meta["gate_status"] = "hook_not_fired"     # the Stop hook never ran, so this is not a gate run; excluded from effect numbers
     for f in glob.glob(str(run / ".done-contract/*/contract.json")): meta["contract"] = json.loads(Path(f).read_text())
     for f in glob.glob(str(run / ".done-contract/*/evidence.json")): meta["evidence_verdict"] = json.loads(Path(f).read_text()).get("verdict")

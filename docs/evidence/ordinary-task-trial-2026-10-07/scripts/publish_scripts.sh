@@ -3,14 +3,20 @@
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$HERE/../.."; OUT="$REPO/docs/evidence/ordinary-task-trial-2026-10-07"
 rm -rf "$OUT/scripts"; mkdir -p "$OUT/scripts/hidden"
-for f in check_run.py common.py run_trial.py run_other.py regrade.py reprocess.py contract_cross.py summarize.py make_report.py build_results.py validate_reference.py validate_adversarial.py publish_scripts.sh; do cp "$HERE/$f" "$OUT/scripts/$f"; done
+for f in check_run.py common.py run_trial.py run_other.py regrade.py reprocess.py contract_cross.py summarize.py make_report.py build_results.py validate_reference.py validate_adversarial.py grade_snapshots.py indep_sanity.py make_indep_report.py build_indep_results.py publish_scripts.sh; do cp "$HERE/$f" "$OUT/scripts/$f"; done
 cp "$HERE"/hidden/*.test.ts "$HERE"/hidden/*.cjs "$OUT/scripts/hidden/"
 cp "$HERE/results.csv" "$OUT/results.csv"
 cp "$HERE/data/classification.json" "$OUT/classification.json"; cp "$HERE/data/classification_notes.json" "$OUT/classification_notes.json"
-python3 - "$OUT" <<'PY'
+cp "$(sed 's/TOOL=//' "$HERE/tool_path.txt")/wrap/done-contract" "$OUT/scripts/snapshot_wrapper.py"
+OUT2="$REPO/docs/evidence/independent-contract-trial-2026-10-07"; mkdir -p "$OUT2/contracts"
+cp "$HERE"/contracts/T*.json "$OUT2/contracts/"; cp "$HERE/results_indep.csv" "$OUT2/results_indep.csv"
+cp "$HERE/data/classification.json" "$OUT2/classification.json"; cp "$HERE/data/classification_notes.json" "$OUT2/classification_notes.json"; cp "$HERE/data/escapes.json" "$OUT2/escapes.json"
+TMPX="$(mktemp -d)"; tar xzf "$HERE/data/author_archive.tgz" -C "$TMPX" author/VALIDATION.md 2>/dev/null && cp "$TMPX/author/VALIDATION.md" "$OUT2/contracts/VALIDATION.md"; rm -rf "$TMPX"
+python3 - "$OUT" "$OUT2" <<'PY'
 import sys, pathlib
-out = pathlib.Path(sys.argv[1]); home = "~"
-for p in list(out.rglob("*.py")) + list(out.rglob("*.sh")) + list(out.rglob("*.json")) + list(out.rglob("*.md")):
+home = "~"
+for out in [pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])]:
+  for p in list(out.rglob("*.py")) + list(out.rglob("*.sh")) + list(out.rglob("*.json")) + list(out.rglob("*.md")) + list(out.rglob("*.csv")):
     t = p.read_text()
     if home in t: p.write_text(t.replace(home, "~"))
 PY
